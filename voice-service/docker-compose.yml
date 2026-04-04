@@ -7,17 +7,12 @@ services:
     volumes:
       - ./models:/app/models
       - ./voices:/app/voices
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # GPU passthrough REMOVED — Blackwell sm_120 crashes both PyTorch and CTranslate2
+    # Re-enable once CUDA support stabilizes for sm_120
     environment:
       - VOXSTATION_WHISPER_MODEL=large-v3
-      - VOXSTATION_WHISPER_DEVICE=cuda
-      # PyTorch nightly cu128 doesn't have Blackwell sm_120 kernels yet
-      # faster-whisper (CTranslate2) works on CUDA, but Chatterbox (PyTorch) must use CPU
+      - VOXSTATION_WHISPER_DEVICE=cpu
       - VOXSTATION_XTTS_DEVICE=cpu
+      # Hide GPU from all CUDA libraries to prevent crash on init
+      - CUDA_VISIBLE_DEVICES=
     restart: "no"
