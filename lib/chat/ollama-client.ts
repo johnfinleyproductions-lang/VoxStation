@@ -42,9 +42,13 @@ export async function streamOllamaChat(
     allMessages.unshift({ role: "system", content: options.system });
   }
 
-  const res = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+  const ollamaUrl = `${OLLAMA_BASE_URL}/api/chat`;
+  console.log("[ollama] Fetching:", ollamaUrl, "model:", model);
+
+  const res = await fetch(ollamaUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    cache: "no-store",
     body: JSON.stringify({
       model,
       messages: allMessages,
@@ -54,6 +58,8 @@ export async function streamOllamaChat(
       },
     }),
   });
+
+  console.log("[ollama] Response status:", res.status);
 
   if (!res.ok) {
     const err = await res.text();
