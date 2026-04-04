@@ -1,13 +1,13 @@
-"""
-Ollama Client
-==============
-Streaming chat client for Ollama running on the Framestation.
-Supports conversation history and system prompts.
-"""
+/**
+ * Ollama Client
+ * ==============
+ * Streaming chat client for Ollama running on the Framestation.
+ * Supports conversation history and system prompts.
+ */
 
 const OLLAMA_BASE_URL =
   process.env.OLLAMA_BASE_URL || "http://192.168.4.240:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen2.5:32b";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "nemotron-3-nano:30b";
 
 export interface OllamaMessage {
   role: "system" | "user" | "assistant";
