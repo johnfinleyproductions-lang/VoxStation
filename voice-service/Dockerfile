@@ -7,9 +7,13 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-venv ffmpeg libsndfile1 git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PyTorch with CUDA 12.8 (required for Blackwell sm_120)
+# Install PyTorch NIGHTLY with CUDA 12.8 (required for Blackwell sm_120)
+# The --pre flag pulls nightly/pre-release builds that include sm_120 kernels
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+RUN pip3 install --no-cache-dir --pre torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+
+# Verify sm_120 is supported before installing everything else
+RUN python3 -c "import torch; archs = torch.cuda.get_arch_list(); print('CUDA archs:', archs); assert any('sm_12' in a or '12.0' in a for a in archs), f'sm_120 NOT in {archs}'"
 
 # Install remaining deps
 RUN pip3 install --no-cache-dir -r requirements.txt

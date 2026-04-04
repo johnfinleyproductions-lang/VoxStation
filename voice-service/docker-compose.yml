@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   voxstation-voice:
     build: .
@@ -20,4 +18,4 @@ services:
       - VOXSTATION_WHISPER_MODEL=large-v3
       - VOXSTATION_WHISPER_DEVICE=cuda
       - VOXSTATION_XTTS_DEVICE=cuda
-    restart: unless-stopped
+    restart: "no"
