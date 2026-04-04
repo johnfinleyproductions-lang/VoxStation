@@ -1,8 +1,8 @@
 """
 TTS Service with Voice Cloning
 ===============================
-GPU-accelerated text-to-speech using Coqui XTTS v2.
-Supports zero-shot voice cloning from reference audio samples.
+GPU-accelerated text-to-speech using Chatterbox (Resemble AI).
+Zero-shot voice cloning from a short reference audio sample.
 """
 
 import io
@@ -14,7 +14,7 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 import torch
-from TTS.api import TTS
+import torchaudio
 
 from config import settings
 
@@ -22,26 +22,26 @@ logger = logging.getLogger("voxstation.tts")
 
 
 class TTSService:
-    """Manages XTTS v2 model, voice profiles, and synthesis."""
+    """Manages Chatterbox model, voice profiles, and synthesis."""
 
     def __init__(self):
-        self.model: Optional[TTS] = None
+        self.model = None
         self.voices_dir = settings.voices_dir
         self.voices_dir.mkdir(parents=True, exist_ok=True)
 
     def load_model(self):
-        """Load XTTS v2 onto GPU."""
-        self.model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(
-            settings.xtts_device
-        )
-        logger.info("XTTS v2 loaded on %s", settings.xtts_device)
+        """Load Chatterbox TTS onto GPU."""
+        from chatterbox.tts import ChatterboxTTS
+
+        self.model = ChatterboxTTS.from_pretrained(device=settings.xtts_device)
+        logger.info("Chatterbox TTS loaded on %s", settings.xtts_device)
 
     def unload(self):
         """Release model from memory."""
         self.model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        logger.info("XTTS v2 model unloaded")
+        logger.info("Chatterbox TTS model unloaded")
 
     def list_voices(self) -> list[dict]:
         """List all available voice profiles."""
@@ -63,15 +63,16 @@ class TTSService:
             })
         return voices
 
-    def get_voice_samples(self, voice_id: str) -> list[str]:
-        """Get file paths to a voice's reference samples."""
+    def get_voice_sample(self, voice_id: str) -> str:
+        """Get file path to a voice's reference sample (best one)."""
         voice_dir = self.voices_dir / voice_id
         if not voice_dir.exists():
             raise ValueError(f"Voice '{voice_id}' not found")
         samples = sorted(voice_dir.glob("*.wav"))
         if not samples:
             raise ValueError(f"No WAV samples found for voice '{voice_id}'")
-        return [str(s) for s in samples]
+        # Use the first/primary sample
+        return str(samples[0])
 
     async def clone_voice(
         self,
@@ -102,16 +103,16 @@ class TTSService:
         sample_num = len(existing) + 1
         sample_path = voice_dir / f"sample_{sample_num:02d}.wav"
 
-        # Normalize audio to 22050Hz mono WAV
+        # Normalize audio to 24000Hz mono WAV (Chatterbox native rate)
         audio_data, sr = sf.read(io.BytesIO(audio_bytes))
         if len(audio_data.shape) > 1:
             audio_data = audio_data.mean(axis=1)  # stereo to mono
-        if sr != settings.sample_rate:
+        if sr != 24000:
             import scipy.signal
-            num_samples = int(len(audio_data) * settings.sample_rate / sr)
+            num_samples = int(len(audio_data) * 24000 / sr)
             audio_data = scipy.signal.resample(audio_data, num_samples)
 
-        sf.write(str(sample_path), audio_data, settings.sample_rate)
+        sf.write(str(sample_path), audio_data, 24000)
 
         # Update metadata
         meta_file = voice_dir / "meta.json"
@@ -146,35 +147,37 @@ class TTSService:
         Args:
             text: Text to speak
             voice_id: Voice profile to use
-            language: Language code
+            language: Language code (not used by Chatterbox, kept for API compat)
 
         Returns:
             WAV audio bytes
         """
         if self.model is None:
-            raise RuntimeError("XTTS v2 model not loaded")
+            raise RuntimeError("Chatterbox TTS model not loaded")
 
-        # Get reference samples for voice cloning
-        speaker_wavs = self.get_voice_samples(voice_id)
+        # Get reference sample for voice cloning
+        speaker_wav = self.get_voice_sample(voice_id)
 
         logger.info(
-            "Synthesizing %d chars with voice '%s' (%d samples)",
+            "Synthesizing %d chars with voice '%s'",
             len(text),
             voice_id,
-            len(speaker_wavs),
         )
 
-        # Generate speech
-        wav = self.model.tts(
+        # Generate speech with Chatterbox
+        wav_tensor = self.model.generate(
             text=text,
-            speaker_wav=speaker_wavs,
-            language=language,
+            audio_prompt_path=speaker_wav,
         )
 
-        # Convert to WAV bytes
-        wav_array = np.array(wav)
+        # Convert tensor to WAV bytes
         buffer = io.BytesIO()
-        sf.write(buffer, wav_array, settings.sample_rate, format="WAV")
+        torchaudio.save(
+            buffer,
+            wav_tensor.cpu(),
+            self.model.sr,
+            format="wav",
+        )
         buffer.seek(0)
 
         audio_bytes = buffer.read()

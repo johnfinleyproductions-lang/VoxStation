@@ -4,11 +4,12 @@ WORKDIR /app
 
 # System deps
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-venv ffmpeg libsndfile1 \
+    python3 python3-pip python3-venv ffmpeg libsndfile1 git \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps
+# Python deps — install torch first to avoid conflicts
 COPY requirements.txt .
+RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cu124
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # App code
