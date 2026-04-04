@@ -1,6 +1,9 @@
 # VoxStation
 
-Voice-enabled AI chat with local Whisper STT, Ollama LLM + RAG, and cloned voice TTS.
+Voice-enabled AI chat powered by local GPU. Speak to your AI assistant and hear it respond in your own cloned voice.
+
+**Stack:** Whisper STT → Ollama LLM + Qdrant RAG → XTTS v2 Voice-Cloned TTS
+
 All processing runs locally on the Framestation 395 with NVIDIA RTX PRO 4500 Blackwell (32GB VRAM). No cloud APIs for the voice pipeline.
 
 ## Features

@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  voxstation-voice:
+    build: .
+    container_name: voxstation_voice
+    ports:
+      - "8020:8020"
+    volumes:
+      - ./models:/app/models
+      - ./voices:/app/voices
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - VOXSTATION_WHISPER_MODEL=large-v3
+      - VOXSTATION_WHISPER_DEVICE=cuda
+      - VOXSTATION_XTTS_DEVICE=cuda
+    restart: unless-stopped
