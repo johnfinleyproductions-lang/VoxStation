@@ -4,7 +4,8 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { ChatPanel } from "@/components/chat/chat-panel";
 import { VoiceControls } from "@/components/voice/voice-controls";
 import { StatusBar } from "@/components/layout/status-bar";
-import { Mic, Settings, Zap } from "lucide-react";
+import { Mic, Settings, Zap, UserCircle } from "lucide-react";
+import Link from "next/link";
 
 export interface Message {
   id: string;
@@ -18,20 +19,29 @@ export default function VoxStationPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
-  const [voiceId, setVoiceId] = useState("default");
+  const [voiceId, setVoiceId] = useState("john");
   const [useRAG, setUseRAG] = useState(true);
+  const [voices, setVoices] = useState<string[]>([]);
   const [serviceStatus, setServiceStatus] = useState<{
     voice: boolean;
     ollama: boolean;
     rag: boolean;
   }>({ voice: false, ollama: false, rag: false });
 
-  // Check service health on mount
+  // Check service health and available voices on mount
   useEffect(() => {
     async function checkHealth() {
       try {
         const res = await fetch("/api/voice/voices");
-        setServiceStatus((s) => ({ ...s, voice: res.ok }));
+        if (res.ok) {
+          const data = await res.json();
+          setServiceStatus((s) => ({ ...s, voice: true }));
+          if (data.voices) {
+            setVoices(data.voices.map((v: any) => v.id));
+          }
+        } else {
+          setServiceStatus((s) => ({ ...s, voice: false }));
+        }
       } catch {
         setServiceStatus((s) => ({ ...s, voice: false }));
       }
@@ -199,6 +209,8 @@ export default function VoxStationPage() {
     [sendMessage]
   );
 
+  const hasVoiceProfile = voices.length > 0;
+
   return (
     <div className="flex flex-col h-screen bg-[var(--background)]">
       {/* Header */}
@@ -214,6 +226,19 @@ export default function VoxStationPage() {
         </div>
 
         <div className="flex items-center gap-4">
+          {/* Clone Voice link */}
+          <Link
+            href="/clone"
+            className={`flex items-center gap-1.5 text-xs px-3 py-1 rounded transition-colors ${
+              hasVoiceProfile
+                ? "bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--foreground)]"
+                : "bg-amber-500/20 text-amber-400 animate-pulse"
+            }`}
+          >
+            <UserCircle className="w-3 h-3" />
+            {hasVoiceProfile ? "Voice" : "Clone Voice"}
+          </Link>
+
           {/* RAG toggle */}
           <button
             onClick={() => setUseRAG(!useRAG)}
@@ -240,6 +265,15 @@ export default function VoxStationPage() {
           </button>
         </div>
       </header>
+
+      {/* No voice profile banner */}
+      {!hasVoiceProfile && (
+        <div className="bg-amber-500/10 border-b border-amber-500/20 px-6 py-2 text-center">
+          <Link href="/clone" className="text-sm text-amber-400 hover:text-amber-300">
+            No voice profile yet — tap here to clone your voice so VoxStation can speak like you
+          </Link>
+        </div>
+      )}
 
       {/* Chat area */}
       <ChatPanel
