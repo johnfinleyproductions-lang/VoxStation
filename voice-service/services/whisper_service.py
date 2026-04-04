@@ -1,8 +1,8 @@
 """
 Whisper STT Service
 ===================
-GPU-accelerated speech-to-text using faster-whisper (CTranslate2).
-~3x faster than OpenAI whisper with same accuracy.
+Speech-to-text using faster-whisper (CTranslate2).
+GPU-accelerated when CUDA available, falls back to CPU with int8.
 """
 
 import io
@@ -27,18 +27,25 @@ class WhisperService:
         self.model: Optional[WhisperModel] = None
 
     def load_model(self):
-        """Load the Whisper model onto GPU."""
+        """Load the Whisper model."""
+        compute_type = settings.effective_compute_type
+        logger.info(
+            "Loading Whisper %s on %s (%s)...",
+            settings.whisper_model,
+            settings.whisper_device,
+            compute_type,
+        )
         self.model = WhisperModel(
             settings.whisper_model,
             device=settings.whisper_device,
-            compute_type=settings.whisper_compute_type,
+            compute_type=compute_type,
             download_root=str(settings.models_dir / "whisper"),
         )
         logger.info(
             "Whisper %s loaded on %s (%s)",
             settings.whisper_model,
             settings.whisper_device,
-            settings.whisper_compute_type,
+            compute_type,
         )
 
     def unload(self):
@@ -102,7 +109,7 @@ class WhisperService:
         }
 
         logger.info(
-            "Transcribed %.1fs audio → %d chars (%s, p=%.2f)",
+            "Transcribed %.1fs audio \u2192 %d chars (%s, p=%.2f)",
             info.duration,
             len(full_text),
             info.language,

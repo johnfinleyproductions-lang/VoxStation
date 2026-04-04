@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     # Whisper STT
     whisper_model: str = "large-v3"
     whisper_device: str = "cuda"
-    whisper_compute_type: str = "float16"
+    whisper_compute_type: str = ""  # empty = auto-detect based on device
 
     # XTTS v2 TTS
     xtts_device: str = "cuda"
@@ -27,6 +27,13 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: list[str] = ["http://localhost:3050", "http://192.168.4.165:3050"]
+
+    @property
+    def effective_compute_type(self) -> str:
+        """Auto-detect compute type if not explicitly set."""
+        if self.whisper_compute_type:
+            return self.whisper_compute_type
+        return "float16" if self.whisper_device == "cuda" else "int8"
 
     model_config = {"env_file": ".env", "env_prefix": "VOXSTATION_"}
 

@@ -10,7 +10,8 @@ services:
     # GPU passthrough REMOVED — Blackwell sm_120 crashes both PyTorch and CTranslate2
     # Re-enable once CUDA support stabilizes for sm_120
     environment:
-      - VOXSTATION_WHISPER_MODEL=large-v3
+      # Use base model on CPU (large-v3 would be too slow without GPU)
+      - VOXSTATION_WHISPER_MODEL=base
       - VOXSTATION_WHISPER_DEVICE=cpu
       - VOXSTATION_XTTS_DEVICE=cpu
       # Hide GPU from all CUDA libraries to prevent crash on init
