@@ -1,9 +1,9 @@
-"""
-Voice Recorder
-==============
-WebAudio-based recording utilities for capturing mic input.
-Returns audio as a Blob ready to send to the Whisper STT service.
-"""
+/**
+ * Voice Recorder
+ * ==============
+ * WebAudio-based recording utilities for capturing mic input.
+ * Returns audio as a Blob ready to send to the Whisper STT service.
+ */
 
 export type RecorderState = "idle" | "recording" | "processing";
 

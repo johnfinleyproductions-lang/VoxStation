@@ -1,9 +1,9 @@
-"""
-RAG Client
-===========
-Query the Qdrant vector database for relevant course content.
-Uses Ollama embeddings (nomic-embed-text) for query vectorization.
-"""
+/**
+ * RAG Client
+ * ===========
+ * Query the Qdrant vector database for relevant course content.
+ * Uses Ollama embeddings (nomic-embed-text) for query vectorization.
+ */
 
 import { generateEmbedding } from "./ollama-client";
 

@@ -1,9 +1,9 @@
-"""
-Voice Client
-=============
-API client for the VoxStation voice service (Whisper STT + XTTS v2 TTS).
-Used by Next.js API routes to proxy requests to the Framestation.
-"""
+/**
+ * Voice Client
+ * =============
+ * API client for the VoxStation voice service (Whisper STT + Chatterbox TTS).
+ * Used by Next.js API routes to proxy requests to the Framestation.
+ */
 
 const VOICE_SERVICE_URL =
   process.env.VOICE_SERVICE_URL || "http://192.168.4.240:8020";
@@ -55,7 +55,7 @@ export async function transcribeAudio(
 }
 
 /**
- * Synthesize text to speech using XTTS v2.
+ * Synthesize text to speech using Chatterbox TTS.
  * Returns WAV audio as an ArrayBuffer.
  */
 export async function synthesizeSpeech(
