@@ -3,6 +3,10 @@ TTS Service with Voice Cloning
 ===============================
 GPU-accelerated text-to-speech using Chatterbox (Resemble AI).
 Zero-shot voice cloning from a short reference audio sample.
+
+Note: On Blackwell GPUs (sm_120), Chatterbox runs on CPU because
+PyTorch doesn't ship sm_120 kernels yet. faster-whisper uses CTranslate2
+which has its own CUDA backend and works fine on Blackwell.
 """
 
 import io
@@ -30,11 +34,13 @@ class TTSService:
         self.voices_dir.mkdir(parents=True, exist_ok=True)
 
     def load_model(self):
-        """Load Chatterbox TTS onto GPU."""
+        """Load Chatterbox TTS onto configured device."""
         from chatterbox.tts import ChatterboxTTS
 
-        self.model = ChatterboxTTS.from_pretrained(device=settings.xtts_device)
-        logger.info("Chatterbox TTS loaded on %s", settings.xtts_device)
+        device = settings.xtts_device
+        logger.info("Loading Chatterbox TTS on %s...", device)
+        self.model = ChatterboxTTS.from_pretrained(device=device)
+        logger.info("Chatterbox TTS loaded on %s", device)
 
     def unload(self):
         """Release model from memory."""
@@ -84,16 +90,6 @@ class TTSService:
     ) -> dict:
         """
         Save a voice reference sample for cloning.
-
-        Args:
-            voice_id: Unique voice identifier (e.g., 'john')
-            audio_bytes: WAV audio bytes of the reference sample
-            filename: Original filename
-            name: Display name for the voice
-            description: Optional description
-
-        Returns:
-            Voice profile dict
         """
         voice_dir = self.voices_dir / voice_id
         voice_dir.mkdir(parents=True, exist_ok=True)
@@ -143,14 +139,6 @@ class TTSService:
     ) -> bytes:
         """
         Synthesize text to speech using a cloned voice.
-
-        Args:
-            text: Text to speak
-            voice_id: Voice profile to use
-            language: Language code (not used by Chatterbox, kept for API compat)
-
-        Returns:
-            WAV audio bytes
         """
         if self.model is None:
             raise RuntimeError("Chatterbox TTS model not loaded")
@@ -159,9 +147,10 @@ class TTSService:
         speaker_wav = self.get_voice_sample(voice_id)
 
         logger.info(
-            "Synthesizing %d chars with voice '%s'",
+            "Synthesizing %d chars with voice '%s' on %s",
             len(text),
             voice_id,
+            settings.xtts_device,
         )
 
         # Generate speech with Chatterbox

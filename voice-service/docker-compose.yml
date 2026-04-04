@@ -17,5 +17,7 @@ services:
     environment:
       - VOXSTATION_WHISPER_MODEL=large-v3
       - VOXSTATION_WHISPER_DEVICE=cuda
-      - VOXSTATION_XTTS_DEVICE=cuda
+      # PyTorch nightly cu128 doesn't have Blackwell sm_120 kernels yet
+      # faster-whisper (CTranslate2) works on CUDA, but Chatterbox (PyTorch) must use CPU
+      - VOXSTATION_XTTS_DEVICE=cpu
     restart: "no"
