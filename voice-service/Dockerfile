@@ -7,13 +7,16 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-venv ffmpeg libsndfile1 git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PyTorch NIGHTLY with CUDA 12.8 (required for Blackwell sm_120)
-# The --pre flag pulls nightly/pre-release builds that include sm_120 kernels
+# Install CPU-only PyTorch (no CUDA kernels)
+# This prevents PyTorch from crashing on Blackwell sm_120 GPUs.
+# faster-whisper uses CTranslate2 which has its own CUDA backend
+# that works fine on Blackwell - it doesn't need PyTorch CUDA.
+# Chatterbox TTS uses PyTorch but runs on CPU.
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir packaging
-RUN pip3 install --no-cache-dir --pre torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
-# Install remaining deps (skip torch/torchaudio since nightly is already installed)
+# Install remaining deps
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # App code
