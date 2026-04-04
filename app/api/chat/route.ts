@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
-import { streamOllamaChat, type OllamaMessage } from "@/lib/chat/ollama-client";
 import { searchRAG, buildRAGContext } from "@/lib/chat/rag-client";
+import type { OllamaMessage } from "@/lib/chat/ollama-client";
+
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "nemotron-3-nano:30b";
 
 const SYSTEM_PROMPT = `You are VoxStation, a helpful AI assistant running locally on the user's Framestation GPU. You have access to a knowledge base of educational course materials via RAG. Be concise but thorough — your responses will be spoken aloud via text-to-speech, so keep them conversational and clear. Avoid markdown formatting, bullet points, and code blocks unless specifically asked. Speak naturally.`;
 
@@ -20,20 +23,19 @@ export async function POST(req: NextRequest) {
       useRAG?: boolean;
     } = body;
 
-    console.log("[chat] Messages:", messages.length, "useRAG:", useRAG, "model:", model || "default");
+    console.log("[chat] Messages:", messages.length, "useRAG:", useRAG);
 
     if (!messages || messages.length === 0) {
       return new Response("No messages provided", { status: 400 });
     }
 
-    // Get the latest user message for RAG
     const lastUserMessage = [...messages]
       .reverse()
       .find((m) => m.role === "user");
 
     let systemPrompt = SYSTEM_PROMPT;
 
-    // RAG retrieval if enabled
+    // RAG retrieval
     if (useRAG && lastUserMessage) {
       try {
         console.log("[chat] Starting RAG search...");
@@ -44,46 +46,95 @@ export async function POST(req: NextRequest) {
           systemPrompt += `\n\n${context}\n\nUse this context to inform your answer when relevant. Cite sources naturally (e.g., "According to the storytelling course...").`;
         }
       } catch (ragError) {
-        console.warn("[chat] RAG search failed, continuing without context:", ragError);
+        console.warn("[chat] RAG failed, continuing without context:", ragError);
       }
     }
 
-    // Stream from Ollama
-    console.log("[chat] Calling Ollama at", process.env.OLLAMA_BASE_URL || "FALLBACK: http://192.168.4.240:11434");
-    const stream = await streamOllamaChat(messages, {
-      model,
-      system: systemPrompt,
-    });
-    console.log("[chat] Ollama stream created, returning SSE response");
+    // Build messages with system prompt
+    const allMessages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...messages,
+    ];
 
-    // Convert to SSE format for the frontend
+    const selectedModel = model || OLLAMA_MODEL;
+    const ollamaUrl = `${OLLAMA_BASE_URL}/api/chat`;
+    console.log("[chat] Fetching Ollama:", ollamaUrl, "model:", selectedModel);
+
+    // Fetch Ollama directly — no intermediate ReadableStream
+    const ollamaRes = await fetch(ollamaUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({
+        model: selectedModel,
+        messages: allMessages,
+        stream: true,
+        options: { temperature: 0.7 },
+      }),
+    });
+
+    console.log("[chat] Ollama status:", ollamaRes.status);
+
+    if (!ollamaRes.ok) {
+      const err = await ollamaRes.text();
+      console.error("[chat] Ollama error:", err);
+      return new Response(`Ollama error: ${err}`, { status: 502 });
+    }
+
+    // Use TransformStream to convert Ollama NDJSON -> SSE
     const encoder = new TextEncoder();
-    const sseStream = new ReadableStream({
-      async start(controller) {
-        const reader = stream.getReader();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              controller.close();
-              break;
-            }
-            const sseData = `data: ${JSON.stringify({ content: value })}\n\n`;
-            controller.enqueue(encoder.encode(sseData));
-          }
-        } catch (error) {
-          console.error("[chat] Stream read error:", error);
-          controller.error(error);
-        }
-      },
-    });
+    const decoder = new TextDecoder();
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
 
-    return new Response(sseStream, {
+    // Pipe in background — don't await
+    const ollamaReader = ollamaRes.body!.getReader();
+    (async () => {
+      try {
+        let buffer = "";
+        while (true) {
+          const { done, value } = await ollamaReader.read();
+          if (done) {
+            console.log("[chat] Ollama stream finished");
+            await writer.write(encoder.encode("data: [DONE]\n\n"));
+            await writer.close();
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || ""; // keep incomplete line in buffer
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const chunk = JSON.parse(line);
+              if (chunk.message?.content) {
+                const sseData = `data: ${JSON.stringify({ content: chunk.message.content })}\n\n`;
+                await writer.write(encoder.encode(sseData));
+              }
+              if (chunk.done) {
+                console.log("[chat] Ollama done signal received");
+                await writer.write(encoder.encode("data: [DONE]\n\n"));
+                await writer.close();
+                return;
+              }
+            } catch {
+              // skip malformed JSON lines
+            }
+          }
+        }
+      } catch (error) {
+        console.error("[chat] Stream pipe error:", error);
+        try { await writer.abort(error as Error); } catch {}
+      }
+    })();
+
+    console.log("[chat] Returning SSE response");
+    return new Response(readable, {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
         "X-Accel-Buffering": "no",
       },
     });
