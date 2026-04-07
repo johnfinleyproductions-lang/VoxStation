@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────
+# vox — Start, stop, and check VoxStation services
+#
+# Usage:
+#   vox              Start all services (smart — skips what's already running)
+#   vox start        Same as above
+#   vox stop         Stop all VoxStation services
+#   vox restart      Stop then start
+#   vox status       Show what's running
+#   vox logs [svc]   Tail logs (voice | frontend | ollama | qdrant)
+# ──────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+VOXSTATION_DIR="$HOME/VoxStation"
+VOICE_CONTAINER="voxstation_voice"
+FRONTEND_PID_FILE="$VOXSTATION_DIR/.vox-frontend.pid"
+
+# Ports
+PORT_FRONTEND=3050
+PORT_VOICE=8020
+PORT_OLLAMA=11434
+PORT_QDRANT=6333
+
+# Colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+BOLD='\033[1m'
+
+# ── Helpers ──────────────────────────────────────────────────
+
+_log()  { echo -e "${CYAN}[vox]${NC} $*"; }
+_ok()   { echo -e "${CYAN}[vox]${NC} ${GREEN}✓${NC} $*"; }
+_skip() { echo -e "${CYAN}[vox]${NC} ${YELLOW}⊘${NC} $* (already running)"; }
+_err()  { echo -e "${CYAN}[vox]${NC} ${RED}✗${NC} $*" >&2; }
+
+_port_listening() {
+  ss -tlnp 2>/dev/null | grep -q ":$1 " && return 0
+  return 1
+}
+
+_container_running() {
+  docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true
+}
+
+_wait_for_port() {
+  local port=$1 name=$2 timeout=${3:-30}
+  local elapsed=0
+  while ! _port_listening "$port"; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      _err "$name did not start within ${timeout}s"
+      return 1
+    fi
+  done
+  _ok "$name is up (port $port)"
+}
+
+# ── Status ───────────────────────────────────────────────────
+
+_status() {
+  echo -e "\n${BOLD}VoxStation Service Status${NC}"
+  echo "────────────────────────────────────"
+
+  if _port_listening $PORT_OLLAMA; then
+    echo -e "  Ollama          ${GREEN}● running${NC}  :$PORT_OLLAMA"
+  else
+    echo -e "  Ollama          ${RED}○ stopped${NC}  :$PORT_OLLAMA"
+  fi
+
+  if _port_listening $PORT_QDRANT; then
+    echo -e "  Qdrant          ${GREEN}● running${NC}  :$PORT_QDRANT"
+  else
+    echo -e "  Qdrant          ${RED}○ stopped${NC}  :$PORT_QDRANT"
+  fi
+
+  if _container_running "$VOICE_CONTAINER"; then
+    echo -e "  Voice Service   ${GREEN}● running${NC}  :$PORT_VOICE"
+  else
+    echo -e "  Voice Service   ${RED}○ stopped${NC}  :$PORT_VOICE"
+  fi
+
+  if [ -f "$FRONTEND_PID_FILE" ] && kill -0 "$(cat "$FRONTEND_PID_FILE")" 2>/dev/null; then
+    echo -e "  Next.js         ${GREEN}● running${NC}  :$PORT_FRONTEND"
+  else
+    echo -e "  Next.js         ${RED}○ stopped${NC}  :$PORT_FRONTEND"
+  fi
+
+  echo ""
+}
+
+# ── Start ────────────────────────────────────────────────────
+
+_start() {
+  echo -e "\n${BOLD}Starting VoxStation${NC}"
+  echo "────────────────────────────────────"
+
+  # 1. Ollama
+  if _port_listening $PORT_OLLAMA; then
+    _skip "Ollama"
+  else
+    _log "Starting Ollama..."
+    ollama serve &>/dev/null &
+    _wait_for_port $PORT_OLLAMA "Ollama" 15
+  fi
+
+  # 2. Qdrant
+  if _port_listening $PORT_QDRANT; then
+    _skip "Qdrant"
+  else
+    _log "Starting Qdrant..."
+    # Qdrant may be a systemd service or docker container — adjust as needed
+    if command -v qdrant &>/dev/null; then
+      qdrant &>/dev/null &
+    elif docker image ls | grep -q qdrant; then
+      docker start qdrant 2>/dev/null || \
+        docker run -d --name qdrant -p 6333:6333 -p 6334:6334 \
+          -v "$HOME/qdrant_storage:/qdrant/storage" \
+          qdrant/qdrant
+    else
+      _err "Qdrant not found — install it or start it manually"
+    fi
+    _wait_for_port $PORT_QDRANT "Qdrant" 20
+  fi
+
+  # 3. Voice Service (Docker)
+  if _container_running "$VOICE_CONTAINER"; then
+    _skip "Voice Service"
+  else
+    _log "Starting Voice Service..."
+    # Try to start existing stopped container first
+    if docker start "$VOICE_CONTAINER" 2>/dev/null; then
+      : # started from existing container
+    else
+      # Run a new container
+      _log "Creating new voice container..."
+      cd "$VOXSTATION_DIR/voice-service"
+      # Build if image doesn't exist
+      if ! docker image inspect voxstation-voice &>/dev/null; then
+        _log "Building voice image (first time — takes ~10 min)..."
+        docker build -t voxstation-voice .
+      fi
+      docker run -d \
+        --name "$VOICE_CONTAINER" \
+        -p 8020:8020 \
+        -v ./models:/app/models \
+        -v ./voices:/app/voices \
+        -e VOXSTATION_WHISPER_MODEL=base \
+        -e VOXSTATION_WHISPER_DEVICE=cpu \
+        -e VOXSTATION_XTTS_DEVICE=cpu \
+        -e CUDA_VISIBLE_DEVICES= \
+        voxstation-voice
+      cd "$VOXSTATION_DIR"
+    fi
+    _wait_for_port $PORT_VOICE "Voice Service" 90
+  fi
+
+  # 4. Next.js Frontend
+  if [ -f "$FRONTEND_PID_FILE" ] && kill -0 "$(cat "$FRONTEND_PID_FILE")" 2>/dev/null; then
+    _skip "Next.js frontend"
+  else
+    _log "Starting Next.js frontend..."
+    cd "$VOXSTATION_DIR"
+
+    # Build if .next doesn't exist
+    if [ ! -d ".next" ]; then
+      _log "Building Next.js (first time)..."
+      npm run build
+    fi
+
+    npm start > "$VOXSTATION_DIR/.vox-frontend.log" 2>&1 &
+    echo $! > "$FRONTEND_PID_FILE"
+    _wait_for_port $PORT_FRONTEND "Next.js frontend" 20
+  fi
+
+  echo ""
+  _ok "${BOLD}VoxStation is ready!${NC}"
+  echo -e "    Open ${CYAN}http://192.168.4.176:3050${NC} in your browser"
+  echo ""
+}
+
+# ── Stop ─────────────────────────────────────────────────────
+
+_stop() {
+  echo -e "\n${BOLD}Stopping VoxStation${NC}"
+  echo "────────────────────────────────────"
+
+  # Frontend
+  if [ -f "$FRONTEND_PID_FILE" ]; then
+    local pid
+    pid=$(cat "$FRONTEND_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      _ok "Next.js frontend stopped"
+    fi
+    rm -f "$FRONTEND_PID_FILE"
+  else
+    _log "Next.js frontend not tracked (may not be running)"
+  fi
+
+  # Voice Service
+  if _container_running "$VOICE_CONTAINER"; then
+    docker stop "$VOICE_CONTAINER" >/dev/null
+    _ok "Voice Service stopped"
+  else
+    _log "Voice Service not running"
+  fi
+
+  # Ollama — only stop if we likely started it
+  if pgrep -x ollama &>/dev/null; then
+    pkill -x ollama 2>/dev/null || true
+    _ok "Ollama stopped"
+  else
+    _log "Ollama not running"
+  fi
+
+  echo ""
+  _ok "VoxStation stopped"
+  echo ""
+}
+
+# ── Logs ─────────────────────────────────────────────────────
+
+_logs() {
+  local svc="${1:-voice}"
+  case "$svc" in
+    voice)    docker logs -f "$VOICE_CONTAINER" ;;
+    frontend) tail -f "$VOXSTATION_DIR/.vox-frontend.log" ;;
+    ollama)   journalctl -u ollama -f 2>/dev/null || _err "Ollama logs not available via journalctl" ;;
+    qdrant)   docker logs -f qdrant 2>/dev/null || _err "Qdrant logs not available" ;;
+    *)        _err "Unknown service: $svc (use: voice, frontend, ollama, qdrant)" ;;
+  esac
+}
+
+# ── Main ─────────────────────────────────────────────────────
+
+case "${1:-start}" in
+  start)    _start ;;
+  stop)     _stop ;;
+  restart)  _stop; sleep 2; _start ;;
+  status)   _status ;;
+  logs)     _logs "${2:-voice}" ;;
+  -h|--help|help)
+    echo "Usage: vox [start|stop|restart|status|logs [service]]"
+    echo ""
+    echo "Commands:"
+    echo "  start     Start all services (default, skips what's already up)"
+    echo "  stop      Stop all VoxStation services"
+    echo "  restart   Stop then start"
+    echo "  status    Show service status"
+    echo "  logs      Tail logs (voice|frontend|ollama|qdrant)"
+    ;;
+  *)
+    _err "Unknown command: $1"
+    echo "Usage: vox [start|stop|restart|status|logs [service]]"
+    exit 1
+    ;;
+esac
