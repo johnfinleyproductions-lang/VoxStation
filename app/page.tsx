@@ -4,7 +4,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { ChatPanel } from "@/components/chat/chat-panel";
 import { VoiceControls } from "@/components/voice/voice-controls";
 import { StatusBar } from "@/components/layout/status-bar";
-import { Mic, Settings, Zap, UserCircle } from "lucide-react";
+import { Mic, Settings, Zap, UserCircle, ChevronDown } from "lucide-react";
 import Link from "next/link";
 
 export interface Message {
@@ -15,13 +15,20 @@ export interface Message {
   timestamp: Date;
 }
 
+interface VoiceProfile {
+  id: string;
+  name: string;
+  sample_count: number;
+}
+
 export default function VoxStationPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
-  const [voiceId, setVoiceId] = useState("john");
+  const [voiceId, setVoiceId] = useState("");
   const [useRAG, setUseRAG] = useState(true);
-  const [voices, setVoices] = useState<string[]>([]);
+  const [voices, setVoices] = useState<VoiceProfile[]>([]);
+  const [showVoiceMenu, setShowVoiceMenu] = useState(false);
   const [serviceStatus, setServiceStatus] = useState<{
     voice: boolean;
     ollama: boolean;
@@ -37,7 +44,21 @@ export default function VoxStationPage() {
           const data = await res.json();
           setServiceStatus((s) => ({ ...s, voice: true }));
           if (data.voices) {
-            setVoices(data.voices.map((v: any) => v.id));
+            const profiles = data.voices.map((v: any) => ({
+              id: v.id,
+              name: v.name || v.id,
+              sample_count: v.sample_count || 0,
+            }));
+            setVoices(profiles);
+            // Set default voice to first available if not set
+            if (profiles.length > 0) {
+              setVoiceId((current) => {
+                if (!current || !profiles.find((p: VoiceProfile) => p.id === current)) {
+                  return profiles[0].id;
+                }
+                return current;
+              });
+            }
           }
         } else {
           setServiceStatus((s) => ({ ...s, voice: false }));
@@ -50,6 +71,14 @@ export default function VoxStationPage() {
     const interval = setInterval(checkHealth, 30000);
     return () => clearInterval(interval);
   }, []);
+
+  // Close voice menu when clicking outside
+  useEffect(() => {
+    if (!showVoiceMenu) return;
+    const handleClick = () => setShowVoiceMenu(false);
+    document.addEventListener("click", handleClick);
+    return () => document.removeEventListener("click", handleClick);
+  }, [showVoiceMenu]);
 
   /**
    * Send a text message and stream the response.
@@ -129,7 +158,7 @@ export default function VoxStationPage() {
         }
 
         // TTS: Synthesize response with cloned voice
-        if (voiceEnabled && fullResponse.trim()) {
+        if (voiceEnabled && fullResponse.trim() && voiceId) {
           try {
             const ttsRes = await fetch("/api/voice/synthesize", {
               method: "POST",
@@ -210,6 +239,7 @@ export default function VoxStationPage() {
   );
 
   const hasVoiceProfile = voices.length > 0;
+  const activeVoice = voices.find((v) => v.id === voiceId);
 
   return (
     <div className="flex flex-col h-screen bg-[var(--background)]">
@@ -225,24 +255,79 @@ export default function VoxStationPage() {
           </span>
         </div>
 
-        <div className="flex items-center gap-4">
-          {/* Clone Voice link */}
-          <Link
-            href="/clone"
-            className={`flex items-center gap-1.5 text-xs px-3 py-1 rounded transition-colors ${
-              hasVoiceProfile
-                ? "bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--foreground)]"
-                : "bg-amber-500/20 text-amber-400 animate-pulse"
-            }`}
-          >
-            <UserCircle className="w-3 h-3" />
-            {hasVoiceProfile ? "Voice" : "Clone Voice"}
-          </Link>
+        <div className="flex items-center gap-3">
+          {/* Voice Profile Selector */}
+          {hasVoiceProfile ? (
+            <div className="relative">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowVoiceMenu(!showVoiceMenu);
+                }}
+                className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-[var(--surface)] text-[var(--foreground)] hover:bg-[var(--surface-hover)] transition-colors"
+              >
+                <UserCircle className="w-3.5 h-3.5 text-[var(--accent)]" />
+                <span className="font-medium">{activeVoice?.name || voiceId}</span>
+                <ChevronDown className="w-3 h-3 text-[var(--muted)]" />
+              </button>
+
+              {showVoiceMenu && (
+                <div
+                  className="absolute right-0 top-full mt-1 w-56 bg-[var(--surface)] border border-[var(--border)] rounded-xl shadow-xl overflow-hidden z-50"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="px-3 py-2 border-b border-[var(--border)]">
+                    <span className="text-[10px] uppercase tracking-wider text-[var(--muted)] font-medium">Voice Profiles</span>
+                  </div>
+                  {voices.map((voice) => (
+                    <button
+                      key={voice.id}
+                      onClick={() => {
+                        setVoiceId(voice.id);
+                        setShowVoiceMenu(false);
+                      }}
+                      className={`w-full text-left px-3 py-2.5 text-sm flex items-center justify-between hover:bg-[var(--surface-hover)] transition-colors ${
+                        voice.id === voiceId ? "text-[var(--accent)]" : "text-[var(--foreground)]"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <UserCircle className="w-4 h-4" />
+                        <span className="font-medium">{voice.name}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-[var(--muted)]">
+                          {voice.sample_count} sample{voice.sample_count !== 1 ? "s" : ""}
+                        </span>
+                        {voice.id === voiceId && (
+                          <div className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]" />
+                        )}
+                      </div>
+                    </button>
+                  ))}
+                  <Link
+                    href="/clone"
+                    className="block w-full text-left px-3 py-2.5 text-sm text-[var(--accent)] hover:bg-[var(--surface-hover)] transition-colors border-t border-[var(--border)]"
+                    onClick={() => setShowVoiceMenu(false)}
+                  >
+                    + New Voice Profile
+                  </Link>
+                </div>
+              )}
+            </div>
+          ) : (
+            <Link
+              href="/clone"
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-amber-500/20 text-amber-400 animate-pulse"
+            >
+              <UserCircle className="w-3.5 h-3.5" />
+              Clone Voice
+            </Link>
+          )}
 
           {/* RAG toggle */}
           <button
             onClick={() => setUseRAG(!useRAG)}
-            className={`text-xs px-3 py-1 rounded transition-colors ${
+            className={`text-xs px-3 py-1.5 rounded-lg transition-colors ${
               useRAG
                 ? "bg-[var(--accent)] text-white"
                 : "bg-[var(--surface)] text-[var(--muted)]"
@@ -254,7 +339,7 @@ export default function VoxStationPage() {
           {/* Voice toggle */}
           <button
             onClick={() => setVoiceEnabled(!voiceEnabled)}
-            className={`flex items-center gap-1.5 text-xs px-3 py-1 rounded transition-colors ${
+            className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg transition-colors ${
               voiceEnabled
                 ? "bg-[var(--accent)] text-white"
                 : "bg-[var(--surface)] text-[var(--muted)]"
