@@ -23,6 +23,11 @@ PORT_VOICE=8020
 PORT_OLLAMA=11434
 PORT_QDRANT=6333
 
+# GPU clock speed for Blackwell stability (min=max, no transitions)
+# The RTX PRO 4500 over USB4/Thunderbolt crashes on power state changes.
+# 700 MHz is the max stable speed. See FrameForge README for details.
+GPU_CLOCK_SPEED=700
+
 # Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -36,6 +41,7 @@ BOLD='\033[1m'
 _log()  { echo -e "${CYAN}[vox]${NC} $*"; }
 _ok()   { echo -e "${CYAN}[vox]${NC} ${GREEN}✓${NC} $*"; }
 _skip() { echo -e "${CYAN}[vox]${NC} ${YELLOW}⊘${NC} $* (already running)"; }
+_warn() { echo -e "${CYAN}[vox]${NC} ${YELLOW}!${NC} $*"; }
 _err()  { echo -e "${CYAN}[vox]${NC} ${RED}✗${NC} $*" >&2; }
 
 _port_listening() {
@@ -61,11 +67,62 @@ _wait_for_port() {
   _ok "$name is up (port $port)"
 }
 
+# ── GPU Stabilization ───────────────────────────────────────
+
+_lock_gpu_clocks() {
+  # Blackwell over USB4/Thunderbolt MUST have clocks locked (min=max)
+  # before any CUDA workload or the system will hard-lock.
+  # Ollama uses the GPU for LLM inference, so this is required.
+  if ! command -v nvidia-smi &>/dev/null; then
+    _warn "nvidia-smi not found — skipping GPU clock lock"
+    return 0
+  fi
+
+  if ! nvidia-smi &>/dev/null; then
+    _warn "GPU not responding — skipping clock lock (GPU may not be connected)"
+    return 0
+  fi
+
+  _log "Locking GPU clocks to ${GPU_CLOCK_SPEED} MHz (Blackwell USB4 stability)..."
+  sudo nvidia-smi -pm 1 >/dev/null 2>&1
+  sudo nvidia-smi -lgc "$GPU_CLOCK_SPEED,$GPU_CLOCK_SPEED" >/dev/null 2>&1
+  _ok "GPU clocks locked at ${GPU_CLOCK_SPEED} MHz"
+}
+
+# ── Firewall ────────────────────────────────────────────────
+
+_ensure_firewall() {
+  # CachyOS blocks incoming connections by default.
+  # This rule doesn't survive reboot, so we check every start.
+  if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "dpt:${PORT_FRONTEND}"; then
+    _log "Opening firewall port ${PORT_FRONTEND} for LAN access..."
+    sudo iptables -I INPUT -p tcp --dport "$PORT_FRONTEND" -j ACCEPT
+    _ok "Firewall port ${PORT_FRONTEND} open"
+  else
+    _skip "Firewall port ${PORT_FRONTEND}"
+  fi
+}
+
 # ── Status ───────────────────────────────────────────────────
 
 _status() {
   echo -e "\n${BOLD}VoxStation Service Status${NC}"
   echo "────────────────────────────────────"
+
+  # GPU status
+  if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+    local gpu_clock
+    gpu_clock=$(nvidia-smi --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+    local gpu_locked
+    gpu_locked=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+    if [ "$gpu_clock" = "$gpu_locked" ] 2>/dev/null; then
+      echo -e "  GPU Clocks      ${GREEN}● locked${NC}   ${gpu_clock} MHz"
+    else
+      echo -e "  GPU Clocks      ${RED}● UNLOCKED${NC} ${gpu_clock} MHz ${RED}(DANGER — run vox start)${NC}"
+    fi
+  else
+    echo -e "  GPU             ${YELLOW}○ not detected${NC}"
+  fi
 
   if _port_listening $PORT_OLLAMA; then
     echo -e "  Ollama          ${GREEN}● running${NC}  :$PORT_OLLAMA"
@@ -91,6 +148,13 @@ _status() {
     echo -e "  Next.js         ${RED}○ stopped${NC}  :$PORT_FRONTEND"
   fi
 
+  # Firewall check
+  if sudo iptables -L INPUT -n 2>/dev/null | grep -q "dpt:${PORT_FRONTEND}"; then
+    echo -e "  Firewall :3050  ${GREEN}● open${NC}"
+  else
+    echo -e "  Firewall :3050  ${RED}● blocked${NC}  (Mac can't reach VoxStation)"
+  fi
+
   echo ""
 }
 
@@ -99,6 +163,12 @@ _status() {
 _start() {
   echo -e "\n${BOLD}Starting VoxStation${NC}"
   echo "────────────────────────────────────"
+
+  # 0. Lock GPU clocks BEFORE anything touches the GPU
+  _lock_gpu_clocks
+
+  # 0b. Open firewall for LAN access
+  _ensure_firewall
 
   # 1. Ollama
   if _port_listening $PORT_OLLAMA; then
