@@ -140,7 +140,7 @@ _status() {
   fi
 
   if _container_running "$VOICE_CONTAINER"; then
-    echo -e "  Voice Service   ${GREEN}● running${NC}  :$PORT_VOICE  (GPU)"
+    echo -e "  Voice Service   ${GREEN}● running${NC}  :$PORT_VOICE  (STT=CUDA / TTS=CPU)"
   else
     echo -e "  Voice Service   ${RED}○ stopped${NC}  :$PORT_VOICE"
   fi
@@ -201,11 +201,15 @@ _start() {
     _wait_for_port $PORT_QDRANT "Qdrant" 20
   fi
 
-  # 3. Voice Service (Docker — GPU enabled)
+  # 3. Voice Service (Docker — GPU for STT, CPU for TTS)
+  # NOTE: Whisper STT runs on CUDA via CTranslate2 (Blackwell sm_120 supported).
+  # Chatterbox TTS runs on CPU because PyTorch cu128 nightly does not yet include
+  # compiled sm_120 kernels for Blackwell. Switch VOXSTATION_XTTS_DEVICE=cuda
+  # once PyTorch adds Blackwell support (expected in PyTorch 2.7+).
   if _container_running "$VOICE_CONTAINER"; then
     _skip "Voice Service"
   else
-    _log "Starting Voice Service (GPU mode)..."
+    _log "Starting Voice Service (STT=CUDA, TTS=CPU)..."
     # Try to start existing stopped container first
     if docker start "$VOICE_CONTAINER" 2>/dev/null; then
       : # started from existing container
@@ -226,7 +230,7 @@ _start() {
         -v ./voices:/app/voices \
         -e VOXSTATION_WHISPER_MODEL=large-v2 \
         -e VOXSTATION_WHISPER_DEVICE=cuda \
-        -e VOXSTATION_XTTS_DEVICE=cuda \
+        -e VOXSTATION_XTTS_DEVICE=cpu \
         voxstation-voice
       cd "$VOXSTATION_DIR"
     fi
