@@ -10,17 +10,19 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir packaging
 
-# Install all requirements FIRST — requirements.txt contains torch>=2.5.0
-# which pip satisfies from PyPI stable (2.6.x). That is intentional here.
-RUN pip3 install --no-cache-dir -r requirements.txt
-
-# Install PyTorch nightly cu128 LAST with --force-reinstall.
-# This overwrites the stable torch from requirements.txt with the nightly
-# 2.7+ build that includes compiled Blackwell sm_120 kernels.
-# cu128 matches the nvidia/cuda:12.8.0 base; host driver 13.2 is compatible.
-# MUST be the final pip step — any pip install after this may overwrite it.
-RUN pip3 install --no-cache-dir --force-reinstall torch torchaudio \
+# Step 1: Install PyTorch nightly cu128 FIRST.
+# This build includes Blackwell sm_120 compiled kernels (PyTorch 2.7+).
+# It must be installed before requirements.txt so it is not overwritten.
+RUN pip3 install --no-cache-dir torch torchaudio \
     --index-url https://download.pytorch.org/whl/nightly/cu128
+
+# Step 2: Install all other requirements, explicitly skipping torch/torchaudio.
+# Without this filter, pip downloads the ~530MB stable torch wheel from PyPI
+# and overwrites the nightly build above. Filtering prevents that download
+# entirely — pip sees nightly torch is already installed and skips it for
+# any transitive dependency (e.g. chatterbox-tts) that requires torch.
+RUN grep -vE '^torch|^torchaudio' requirements.txt > /tmp/reqs_notorch.txt && \
+    pip3 install --no-cache-dir -r /tmp/reqs_notorch.txt
 
 # App code
 COPY . .
