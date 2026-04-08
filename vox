@@ -23,10 +23,11 @@ PORT_VOICE=8020
 PORT_OLLAMA=11434
 PORT_QDRANT=6333
 
-# GPU clock speed for Blackwell stability (min=max, no transitions)
-# The RTX PRO 4500 over USB4/Thunderbolt crashes on power state changes.
-# 700 MHz is the max stable speed. See FrameForge README for details.
-GPU_CLOCK_SPEED=700
+# GPU settings for Blackwell over OCuLink
+# 1933 MHz clock locked (min=max), 186W power limit
+# OCuLink bypasses the USB4/Thunderbolt tunnel so higher clocks are stable.
+GPU_CLOCK_SPEED=1933
+GPU_POWER_LIMIT=186
 
 # Colors
 GREEN='\033[0;32m'
@@ -70,9 +71,8 @@ _wait_for_port() {
 # ── GPU Stabilization ───────────────────────────────────────
 
 _lock_gpu_clocks() {
-  # Blackwell over USB4/Thunderbolt MUST have clocks locked (min=max)
-  # before any CUDA workload or the system will hard-lock.
-  # Ollama uses the GPU for LLM inference, so this is required.
+  # Lock GPU clocks (min=max) before any CUDA workload.
+  # Ollama uses the GPU for LLM inference.
   if ! command -v nvidia-smi &>/dev/null; then
     _warn "nvidia-smi not found — skipping GPU clock lock"
     return 0
@@ -83,10 +83,11 @@ _lock_gpu_clocks() {
     return 0
   fi
 
-  _log "Locking GPU clocks to ${GPU_CLOCK_SPEED} MHz (Blackwell USB4 stability)..."
+  _log "Locking GPU: ${GPU_CLOCK_SPEED} MHz, ${GPU_POWER_LIMIT}W..."
   sudo nvidia-smi -pm 1 >/dev/null 2>&1
   sudo nvidia-smi -lgc "$GPU_CLOCK_SPEED,$GPU_CLOCK_SPEED" >/dev/null 2>&1
-  _ok "GPU clocks locked at ${GPU_CLOCK_SPEED} MHz"
+  sudo nvidia-smi -pl "$GPU_POWER_LIMIT" >/dev/null 2>&1
+  _ok "GPU clocks locked at ${GPU_CLOCK_SPEED} MHz, power limit ${GPU_POWER_LIMIT}W"
 }
 
 # ── Firewall ────────────────────────────────────────────────
@@ -115,8 +116,10 @@ _status() {
     gpu_clock=$(nvidia-smi --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
     local gpu_locked
     gpu_locked=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+    local gpu_power
+    gpu_power=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
     if [ "$gpu_clock" = "$gpu_locked" ] 2>/dev/null; then
-      echo -e "  GPU Clocks      ${GREEN}● locked${NC}   ${gpu_clock} MHz"
+      echo -e "  GPU Clocks      ${GREEN}● locked${NC}   ${gpu_clock} MHz  ${gpu_power}W"
     else
       echo -e "  GPU Clocks      ${RED}● UNLOCKED${NC} ${gpu_clock} MHz ${RED}(DANGER — run vox start)${NC}"
     fi
