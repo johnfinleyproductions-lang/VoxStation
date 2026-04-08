@@ -7,14 +7,15 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-venv ffmpeg libsndfile1 git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch (no CUDA kernels)
-# This prevents PyTorch from crashing on Blackwell sm_120 GPUs.
-# faster-whisper uses CTranslate2 which has its own CUDA backend
-# that works fine on Blackwell - it doesn't need PyTorch CUDA.
-# Chatterbox TTS uses PyTorch but runs on CPU.
+# Install PyTorch nightly cu130 — matches nvidia-open-dkms 595.58.03 / CUDA 13.2
+# OCuLink + clock locking (done by vox script before Docker starts) makes
+# Blackwell sm_120 CUDA stable. CPU-only PyTorch is no longer needed.
+# NOTE: If you see CUDA OOM errors, Ollama (LLM) may be using too much VRAM.
+#       Drop VOXSTATION_WHISPER_MODEL to "medium" (~1.5GB) in the vox script,
+#       or stop Ollama, load voice models, then restart Ollama.
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir packaging
-RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
 
 # Install remaining deps
 RUN pip3 install --no-cache-dir -r requirements.txt
