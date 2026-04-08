@@ -72,7 +72,7 @@ _wait_for_port() {
 
 _lock_gpu_clocks() {
   # Lock GPU clocks (min=max) before any CUDA workload.
-  # Ollama uses the GPU for LLM inference.
+  # Both Ollama (LLM) and the voice service Docker container use the GPU.
   if ! command -v nvidia-smi &>/dev/null; then
     _warn "nvidia-smi not found — skipping GPU clock lock"
     return 0
@@ -140,7 +140,7 @@ _status() {
   fi
 
   if _container_running "$VOICE_CONTAINER"; then
-    echo -e "  Voice Service   ${GREEN}● running${NC}  :$PORT_VOICE"
+    echo -e "  Voice Service   ${GREEN}● running${NC}  :$PORT_VOICE  (GPU)"
   else
     echo -e "  Voice Service   ${RED}○ stopped${NC}  :$PORT_VOICE"
   fi
@@ -201,11 +201,11 @@ _start() {
     _wait_for_port $PORT_QDRANT "Qdrant" 20
   fi
 
-  # 3. Voice Service (Docker)
+  # 3. Voice Service (Docker — GPU enabled)
   if _container_running "$VOICE_CONTAINER"; then
     _skip "Voice Service"
   else
-    _log "Starting Voice Service..."
+    _log "Starting Voice Service (GPU mode)..."
     # Try to start existing stopped container first
     if docker start "$VOICE_CONTAINER" 2>/dev/null; then
       : # started from existing container
@@ -220,13 +220,13 @@ _start() {
       fi
       docker run -d \
         --name "$VOICE_CONTAINER" \
+        --gpus all \
         -p 8020:8020 \
         -v ./models:/app/models \
         -v ./voices:/app/voices \
-        -e VOXSTATION_WHISPER_MODEL=base \
-        -e VOXSTATION_WHISPER_DEVICE=cpu \
-        -e VOXSTATION_XTTS_DEVICE=cpu \
-        -e CUDA_VISIBLE_DEVICES= \
+        -e VOXSTATION_WHISPER_MODEL=large-v2 \
+        -e VOXSTATION_WHISPER_DEVICE=cuda \
+        -e VOXSTATION_XTTS_DEVICE=cuda \
         voxstation-voice
       cd "$VOXSTATION_DIR"
     fi
