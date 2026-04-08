@@ -71,8 +71,6 @@ _wait_for_port() {
 # ── GPU Stabilization ───────────────────────────────────────
 
 _lock_gpu_clocks() {
-  # Lock GPU clocks (min=max) before any CUDA workload.
-  # Both Ollama (LLM) and the voice service Docker container use the GPU.
   if ! command -v nvidia-smi &>/dev/null; then
     _warn "nvidia-smi not found — skipping GPU clock lock"
     return 0
@@ -93,8 +91,6 @@ _lock_gpu_clocks() {
 # ── Firewall ────────────────────────────────────────────────
 
 _ensure_firewall() {
-  # CachyOS blocks incoming connections by default.
-  # This rule doesn't survive reboot, so we check every start.
   if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "dpt:${PORT_FRONTEND}"; then
     _log "Opening firewall port ${PORT_FRONTEND} for LAN access..."
     sudo iptables -I INPUT -p tcp --dport "$PORT_FRONTEND" -j ACCEPT
@@ -110,7 +106,6 @@ _status() {
   echo -e "\n${BOLD}VoxStation Service Status${NC}"
   echo "────────────────────────────────────"
 
-  # GPU status
   if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
     local gpu_clock
     gpu_clock=$(nvidia-smi --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
@@ -140,7 +135,7 @@ _status() {
   fi
 
   if _container_running "$VOICE_CONTAINER"; then
-    echo -e "  Voice Service   ${GREEN}● running${NC}  :$PORT_VOICE  (STT=CUDA / TTS=CPU)"
+    echo -e "  Voice Service   ${GREEN}● running${NC}  :$PORT_VOICE  (STT=CUDA / TTS=CUDA)"
   else
     echo -e "  Voice Service   ${RED}○ stopped${NC}  :$PORT_VOICE"
   fi
@@ -151,7 +146,6 @@ _status() {
     echo -e "  Next.js         ${RED}○ stopped${NC}  :$PORT_FRONTEND"
   fi
 
-  # Firewall check
   if sudo iptables -L INPUT -n 2>/dev/null | grep -q "dpt:${PORT_FRONTEND}"; then
     echo -e "  Firewall :3050  ${GREEN}● open${NC}"
   else
@@ -167,10 +161,7 @@ _start() {
   echo -e "\n${BOLD}Starting VoxStation${NC}"
   echo "────────────────────────────────────"
 
-  # 0. Lock GPU clocks BEFORE anything touches the GPU
   _lock_gpu_clocks
-
-  # 0b. Open firewall for LAN access
   _ensure_firewall
 
   # 1. Ollama
@@ -187,7 +178,6 @@ _start() {
     _skip "Qdrant"
   else
     _log "Starting Qdrant..."
-    # Qdrant may be a systemd service or docker container — adjust as needed
     if command -v qdrant &>/dev/null; then
       qdrant &>/dev/null &
     elif docker image ls | grep -q qdrant; then
@@ -201,23 +191,18 @@ _start() {
     _wait_for_port $PORT_QDRANT "Qdrant" 20
   fi
 
-  # 3. Voice Service (Docker — GPU for STT, CPU for TTS)
-  # NOTE: Whisper STT runs on CUDA via CTranslate2 (Blackwell sm_120 supported).
-  # Chatterbox TTS runs on CPU because PyTorch cu128 nightly does not yet include
-  # compiled sm_120 kernels for Blackwell. Switch VOXSTATION_XTTS_DEVICE=cuda
-  # once PyTorch adds Blackwell support (expected in PyTorch 2.7+).
+  # 3. Voice Service — both STT and TTS on CUDA (cu130 nightly, sm_120 Blackwell)
+  # If TTS crashes with "no kernel image available", PyTorch cu130 doesn't have
+  # sm_120 support yet. In that case change VOXSTATION_XTTS_DEVICE back to cpu.
   if _container_running "$VOICE_CONTAINER"; then
     _skip "Voice Service"
   else
-    _log "Starting Voice Service (STT=CUDA, TTS=CPU)..."
-    # Try to start existing stopped container first
+    _log "Starting Voice Service (STT=CUDA, TTS=CUDA)..."
     if docker start "$VOICE_CONTAINER" 2>/dev/null; then
-      : # started from existing container
+      :
     else
-      # Run a new container
       _log "Creating new voice container..."
       cd "$VOXSTATION_DIR/voice-service"
-      # Build if image doesn't exist
       if ! docker image inspect voxstation-voice &>/dev/null; then
         _log "Building voice image (first time — takes ~10 min)..."
         docker build -t voxstation-voice .
@@ -230,7 +215,7 @@ _start() {
         -v ./voices:/app/voices \
         -e VOXSTATION_WHISPER_MODEL=large-v2 \
         -e VOXSTATION_WHISPER_DEVICE=cuda \
-        -e VOXSTATION_XTTS_DEVICE=cpu \
+        -e VOXSTATION_XTTS_DEVICE=cuda \
         voxstation-voice
       cd "$VOXSTATION_DIR"
     fi
@@ -243,13 +228,10 @@ _start() {
   else
     _log "Starting Next.js frontend..."
     cd "$VOXSTATION_DIR"
-
-    # Build if .next doesn't exist
     if [ ! -d ".next" ]; then
       _log "Building Next.js (first time)..."
       npm run build
     fi
-
     npm start > "$VOXSTATION_DIR/.vox-frontend.log" 2>&1 &
     echo $! > "$FRONTEND_PID_FILE"
     _wait_for_port $PORT_FRONTEND "Next.js frontend" 20
@@ -267,7 +249,6 @@ _stop() {
   echo -e "\n${BOLD}Stopping VoxStation${NC}"
   echo "────────────────────────────────────"
 
-  # Frontend
   if [ -f "$FRONTEND_PID_FILE" ]; then
     local pid
     pid=$(cat "$FRONTEND_PID_FILE")
@@ -280,7 +261,6 @@ _stop() {
     _log "Next.js frontend not tracked (may not be running)"
   fi
 
-  # Voice Service
   if _container_running "$VOICE_CONTAINER"; then
     docker stop "$VOICE_CONTAINER" >/dev/null
     _ok "Voice Service stopped"
@@ -288,7 +268,6 @@ _stop() {
     _log "Voice Service not running"
   fi
 
-  # Ollama — only stop if we likely started it
   if pgrep -x ollama &>/dev/null; then
     pkill -x ollama 2>/dev/null || true
     _ok "Ollama stopped"
