@@ -7,25 +7,23 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-venv ffmpeg libsndfile1 git \
     && rm -rf /var/lib/apt/lists/*
 
-# PyTorch cu130 nightly — compiled against CUDA 13.0 which natively targets
-# Blackwell (sm_120). The host driver (13.2) is forward-compatible and the
-# NVIDIA Container Toolkit mounts the driver + CUDA 13.x compat libs at runtime.
-#
-# If this still shows "sm_120 not compatible", the fallback is to swap the
-# FROM line to: nvcr.io/nvidia/pytorch:26.03-py3
-# (NVIDIA's own PyTorch image — guaranteed Blackwell support, ~20GB image)
-# and remove the torch/torchaudio pip install lines below.
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir packaging
-RUN pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
 
-# Install remaining deps
+# Install all requirements FIRST — requirements.txt contains torch>=2.5.0
+# which pip satisfies from PyPI stable (2.6.x). That is intentional here.
 RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Install PyTorch nightly cu128 LAST with --force-reinstall.
+# This overwrites the stable torch from requirements.txt with the nightly
+# 2.7+ build that includes compiled Blackwell sm_120 kernels.
+# cu128 matches the nvidia/cuda:12.8.0 base; host driver 13.2 is compatible.
+# MUST be the final pip step — any pip install after this may overwrite it.
+RUN pip3 install --no-cache-dir --force-reinstall torch torchaudio \
+    --index-url https://download.pytorch.org/whl/nightly/cu128
 
 # App code
 COPY . .
-
-# Create dirs
 RUN mkdir -p models voices
 
 EXPOSE 8020
