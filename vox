@@ -29,6 +29,11 @@ PORT_QDRANT=6333
 GPU_CLOCK_SPEED=1933
 GPU_POWER_LIMIT=186
 
+# Ollama context length — CRITICAL: without this, Ollama allocates the model's
+# maximum context (262K for llama3.2:3b = 22.1 GiB VRAM). Capping at 8192
+# brings llama3.2:3b down to ~3 GiB total, safely alongside the voice service.
+OLLAMA_CTX=8192
+
 # Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -123,7 +128,7 @@ _status() {
   fi
 
   if _port_listening $PORT_OLLAMA; then
-    echo -e "  Ollama          ${GREEN}● running${NC}  :$PORT_OLLAMA"
+    echo -e "  Ollama          ${GREEN}● running${NC}  :$PORT_OLLAMA  (ctx=${OLLAMA_CTX})"
   else
     echo -e "  Ollama          ${RED}○ stopped${NC}  :$PORT_OLLAMA"
   fi
@@ -164,12 +169,14 @@ _start() {
   _lock_gpu_clocks
   _ensure_firewall
 
-  # 1. Ollama
+  # 1. Ollama — context capped at $OLLAMA_CTX tokens
+  # Without OLLAMA_CONTEXT_LENGTH, llama3.2:3b defaults to 262K context
+  # which allocates 22.1 GiB VRAM. At 8192 it's ~3 GiB — safe.
   if _port_listening $PORT_OLLAMA; then
     _skip "Ollama"
   else
-    _log "Starting Ollama..."
-    ollama serve &>/dev/null &
+    _log "Starting Ollama (ctx=${OLLAMA_CTX})..."
+    OLLAMA_CONTEXT_LENGTH=$OLLAMA_CTX ollama serve &>/dev/null &
     _wait_for_port $PORT_OLLAMA "Ollama" 15
   fi
 

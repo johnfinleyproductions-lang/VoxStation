@@ -3,7 +3,9 @@ import { searchRAG, buildRAGContext } from "@/lib/chat/rag-client";
 import type { OllamaMessage } from "@/lib/chat/ollama-client";
 
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "nemotron-3-nano:30b";
+// Fallback to llama3.2:3b — NOT nemotron-3-nano:30b (24 GB — instant OOM)
+// Set OLLAMA_MODEL in .env.local to override
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2:3b";
 
 const SYSTEM_PROMPT = `You are VoxStation, a helpful AI assistant running locally on the user's Framestation GPU. You have access to a knowledge base of educational course materials via RAG. Be concise but thorough — your responses will be spoken aloud via text-to-speech, so keep them conversational and clear. Avoid markdown formatting, bullet points, and code blocks unless specifically asked. Speak naturally.`;
 
