@@ -4,9 +4,9 @@ TTS Service with Voice Cloning
 GPU-accelerated text-to-speech using Chatterbox (Resemble AI).
 Zero-shot voice cloning from a short reference audio sample.
 
-Note: On Blackwell GPUs (sm_120), Chatterbox runs on CPU because
-PyTorch doesn't ship sm_120 kernels yet. faster-whisper uses CTranslate2
-which has its own CUDA backend and works fine on Blackwell.
+Runs on CUDA (Blackwell sm_120) using PyTorch nightly cu128.
+Audio is saved via soundfile — torchaudio.save() in nightly torch 2.12+
+defaults to TorchCodec which is not installed.
 """
 
 import io
@@ -20,7 +20,6 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 import torch
-import torchaudio
 
 from config import settings
 
@@ -110,7 +109,6 @@ class TTSService:
         samples = sorted(voice_dir.glob("*.wav"))
         if not samples:
             raise ValueError(f"No WAV samples found for voice '{voice_id}'")
-        # Use the first/primary sample
         return str(samples[0])
 
     async def clone_voice(
@@ -129,22 +127,18 @@ class TTSService:
         voice_dir = self.voices_dir / voice_id
         voice_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save the audio sample
         existing = list(voice_dir.glob("*.wav"))
         sample_num = len(existing) + 1
         sample_path = voice_dir / f"sample_{sample_num:02d}.wav"
 
-        # Convert to WAV using ffmpeg (handles WebM, MP3, OGG, etc.)
         try:
             wav_bytes = convert_to_wav(audio_bytes)
         except RuntimeError as e:
             logger.error("Audio conversion failed: %s", e)
             raise ValueError(f"Voice clone failed: {e}")
 
-        # Write the converted WAV
         sample_path.write_bytes(wav_bytes)
 
-        # Update metadata
         meta_file = voice_dir / "meta.json"
         meta = {}
         if meta_file.exists():
@@ -173,11 +167,12 @@ class TTSService:
     ) -> bytes:
         """
         Synthesize text to speech using a cloned voice.
+        Uses soundfile to write WAV — avoids torchaudio.save() which
+        requires TorchCodec in nightly torch 2.12+.
         """
         if self.model is None:
             raise RuntimeError("Chatterbox TTS model not loaded")
 
-        # Get reference sample for voice cloning
         speaker_wav = self.get_voice_sample(voice_id)
 
         logger.info(
@@ -187,20 +182,17 @@ class TTSService:
             settings.xtts_device,
         )
 
-        # Generate speech with Chatterbox
         wav_tensor = self.model.generate(
             text=text,
             audio_prompt_path=speaker_wav,
         )
 
-        # Convert tensor to WAV bytes
+        # Convert tensor to numpy and write WAV via soundfile.
+        # torchaudio.save() in nightly 2.12+ defaults to TorchCodec backend
+        # which is not installed — soundfile is always available.
+        wav_numpy = wav_tensor.cpu().squeeze().numpy()
         buffer = io.BytesIO()
-        torchaudio.save(
-            buffer,
-            wav_tensor.cpu(),
-            self.model.sr,
-            format="wav",
-        )
+        sf.write(buffer, wav_numpy, self.model.sr, format="WAV", subtype="PCM_16")
         buffer.seek(0)
 
         audio_bytes = buffer.read()
