@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { cloneVoice } from "@/lib/voice/voice-client";
 
+// Audio upload + ffmpeg WebM→WAV conversion can take 10-20s for long recordings.
+// Next.js defaults to 10s for API routes — set 60s to be safe.
+export const maxDuration = 60;
+
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
