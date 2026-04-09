@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────
-# vox — Start, stop, and check VoxStation services
+# vox — Start, stop, and manage VoxStation services
 #
 # Usage:
 #   vox              Start all services (smart — skips what's already running)
@@ -8,6 +8,8 @@
 #   vox stop         Stop all VoxStation services
 #   vox restart      Stop then start
 #   vox status       Show what's running
+#   vox free         Free VRAM: stop voice service, evict models, show GPU hogs
+#   vox free all     Also stop Open WebUI containers (webui_business, webui_family)
 #   vox logs [svc]   Tail logs (voice | frontend | ollama | qdrant)
 # ──────────────────────────────────────────────────────────────
 
@@ -24,8 +26,6 @@ PORT_OLLAMA=11434
 PORT_QDRANT=6333
 
 # GPU settings for Blackwell over OCuLink
-# 1933 MHz clock locked (min=max), 186W power limit
-# OCuLink bypasses the USB4/Thunderbolt tunnel so higher clocks are stable.
 GPU_CLOCK_SPEED=1933
 GPU_POWER_LIMIT=186
 
@@ -34,12 +34,15 @@ GPU_POWER_LIMIT=186
 # brings llama3.2:3b down to ~3 GiB total, safely alongside the voice service.
 OLLAMA_CTX=8192
 
+# Known GPU-using containers on this machine (besides VoxStation)
+WEBUI_CONTAINERS=("webui_business" "webui_family")
+
 # Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 BOLD='\033[1m'
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -80,12 +83,10 @@ _lock_gpu_clocks() {
     _warn "nvidia-smi not found — skipping GPU clock lock"
     return 0
   fi
-
   if ! nvidia-smi &>/dev/null; then
-    _warn "GPU not responding — skipping clock lock (GPU may not be connected)"
+    _warn "GPU not responding — skipping clock lock"
     return 0
   fi
-
   _log "Locking GPU: ${GPU_CLOCK_SPEED} MHz, ${GPU_POWER_LIMIT}W..."
   sudo nvidia-smi -pm 1 >/dev/null 2>&1
   sudo nvidia-smi -lgc "$GPU_CLOCK_SPEED,$GPU_CLOCK_SPEED" >/dev/null 2>&1
@@ -105,6 +106,104 @@ _ensure_firewall() {
   fi
 }
 
+# ── Free VRAM ───────────────────────────────────────────────
+
+_free() {
+  local mode="${1:-}"
+
+  echo -e "\n${BOLD}Freeing VRAM${NC}"
+  echo "────────────────────────────────────"
+
+  # Show current VRAM state
+  echo -e "${BOLD}Before:${NC}"
+  nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null | \
+    awk -F', ' '{printf "  Used: %s   Free: %s\n", $1, $2}'
+  echo ""
+
+  # 1. Stop VoxStation voice service (~7.8 GiB)
+  if _container_running "$VOICE_CONTAINER"; then
+    _log "Stopping Voice Service (~7.8 GiB)..."
+    docker stop "$VOICE_CONTAINER" >/dev/null
+    _ok "Voice Service stopped"
+  else
+    _log "Voice Service already stopped"
+  fi
+
+  # 2. Evict all Ollama models from VRAM
+  if _port_listening $PORT_OLLAMA; then
+    _log "Evicting Ollama models from VRAM..."
+    local loaded
+    loaded=$(curl -sf http://127.0.0.1:11434/api/ps 2>/dev/null | \
+      python3 -c "import sys,json; [print(m['name']) for m in json.load(sys.stdin).get('models',[])]" 2>/dev/null || true)
+    if [ -n "$loaded" ]; then
+      while IFS= read -r model; do
+        curl -sf -X POST http://127.0.0.1:11434/api/generate \
+          -d "{\"model\":\"$model\",\"keep_alive\":0,\"prompt\":\"\"}" >/dev/null 2>&1 || true
+        _ok "Evicted: $model"
+      done <<< "$loaded"
+    else
+      _log "No models currently in VRAM"
+    fi
+  fi
+
+  # 3. Stop Open WebUI containers if 'all' mode
+  if [ "$mode" = "all" ]; then
+    for container in "${WEBUI_CONTAINERS[@]}"; do
+      if _container_running "$container"; then
+        _log "Stopping $container..."
+        docker stop "$container" >/dev/null
+        _ok "$container stopped"
+      else
+        _log "$container already stopped"
+      fi
+    done
+  fi
+
+  sleep 2
+
+  # 4. Show remaining GPU processes
+  echo ""
+  echo -e "${BOLD}Remaining GPU processes:${NC}"
+  local pmon
+  pmon=$(nvidia-smi pmon -c 1 -s m 2>/dev/null | grep -v '^#' | awk '$4+0 > 50' || true)
+  if [ -n "$pmon" ]; then
+    echo "$pmon" | while IFS= read -r line; do
+      local pid mem cmd
+      pid=$(echo "$line" | awk '{print $2}')
+      mem=$(echo "$line" | awk '{print $4}')
+      cmd=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+      # Try to identify Docker container
+      local cname
+      cname=$(docker ps --format '{{.Names}}' 2>/dev/null | while read -r name; do
+        docker top "$name" 2>/dev/null | awk 'NR>1{print $2}' | grep -q "^${pid}$" && echo "$name" && break
+      done || true)
+      if [ -n "$cname" ]; then
+        echo -e "  ${YELLOW}●${NC} PID $pid  ${mem}MiB  $cmd  ${YELLOW}[Docker: $cname]${NC}"
+        echo -e "    Stop: docker stop $cname"
+      else
+        echo -e "  ${YELLOW}●${NC} PID $pid  ${mem}MiB  $cmd"
+        echo -e "    Stop: sudo kill -9 $pid"
+      fi
+    done
+  else
+    _ok "GPU is clear"
+  fi
+
+  # 5. Final VRAM report
+  echo ""
+  echo -e "${BOLD}After:${NC}"
+  nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null | \
+    awk -F', ' '{printf "  Used: %s   Free: %s\n", $1, $2}'
+
+  if [ "$mode" != "all" ]; then
+    echo ""
+    _warn "Open WebUI containers (webui_business, webui_family) still running."
+    _warn "Run  ${BOLD}vox free all${NC}  to also stop those and fully clear VRAM."
+  fi
+
+  echo ""
+}
+
 # ── Status ───────────────────────────────────────────────────
 
 _status() {
@@ -112,20 +211,23 @@ _status() {
   echo "────────────────────────────────────"
 
   if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
-    local gpu_clock
+    local gpu_clock gpu_locked gpu_power gpu_used gpu_free
     gpu_clock=$(nvidia-smi --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
-    local gpu_locked
     gpu_locked=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
-    local gpu_power
     gpu_power=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+    gpu_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | tr -d ' ')
+    gpu_free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader 2>/dev/null | tr -d ' ')
     if [ "$gpu_clock" = "$gpu_locked" ] 2>/dev/null; then
       echo -e "  GPU Clocks      ${GREEN}● locked${NC}   ${gpu_clock} MHz  ${gpu_power}W"
     else
-      echo -e "  GPU Clocks      ${RED}● UNLOCKED${NC} ${gpu_clock} MHz ${RED}(DANGER — run vox start)${NC}"
+      echo -e "  GPU Clocks      ${RED}● UNLOCKED${NC} ${gpu_clock} MHz ${RED}(run vox start)${NC}"
     fi
+    echo -e "  VRAM            Used: ${gpu_used}   Free: ${gpu_free}"
   else
     echo -e "  GPU             ${YELLOW}○ not detected${NC}"
   fi
+
+  echo ""
 
   if _port_listening $PORT_OLLAMA; then
     echo -e "  Ollama          ${GREEN}● running${NC}  :$PORT_OLLAMA  (ctx=${OLLAMA_CTX})"
@@ -154,9 +256,18 @@ _status() {
   if sudo iptables -L INPUT -n 2>/dev/null | grep -q "dpt:${PORT_FRONTEND}"; then
     echo -e "  Firewall :3050  ${GREEN}● open${NC}"
   else
-    echo -e "  Firewall :3050  ${RED}● blocked${NC}  (Mac can't reach VoxStation)"
+    echo -e "  Firewall :3050  ${RED}● blocked${NC}"
   fi
 
+  echo ""
+  echo -e "${BOLD}Other GPU services:${NC}"
+  for container in "${WEBUI_CONTAINERS[@]}"; do
+    if _container_running "$container"; then
+      echo -e "  $container  ${YELLOW}● running${NC}  (may hold VRAM)"
+    else
+      echo -e "  $container  ${GREEN}○ stopped${NC}"
+    fi
+  done
   echo ""
 }
 
@@ -170,8 +281,6 @@ _start() {
   _ensure_firewall
 
   # 1. Ollama — context capped at $OLLAMA_CTX tokens
-  # Without OLLAMA_CONTEXT_LENGTH, llama3.2:3b defaults to 262K context
-  # which allocates 22.1 GiB VRAM. At 8192 it's ~3 GiB — safe.
   if _port_listening $PORT_OLLAMA; then
     _skip "Ollama"
   else
@@ -198,9 +307,7 @@ _start() {
     _wait_for_port $PORT_QDRANT "Qdrant" 20
   fi
 
-  # 3. Voice Service — both STT and TTS on CUDA (cu130 nightly, sm_120 Blackwell)
-  # If TTS crashes with "no kernel image available", PyTorch cu130 doesn't have
-  # sm_120 support yet. In that case change VOXSTATION_XTTS_DEVICE back to cpu.
+  # 3. Voice Service
   if _container_running "$VOICE_CONTAINER"; then
     _skip "Voice Service"
   else
@@ -265,7 +372,7 @@ _stop() {
     fi
     rm -f "$FRONTEND_PID_FILE"
   else
-    _log "Next.js frontend not tracked (may not be running)"
+    _log "Next.js frontend not tracked"
   fi
 
   if _container_running "$VOICE_CONTAINER"; then
@@ -294,7 +401,7 @@ _logs() {
   case "$svc" in
     voice)    docker logs -f "$VOICE_CONTAINER" ;;
     frontend) tail -f "$VOXSTATION_DIR/.vox-frontend.log" ;;
-    ollama)   journalctl -u ollama -f 2>/dev/null || _err "Ollama logs not available via journalctl" ;;
+    ollama)   journalctl -u ollama -f 2>/dev/null || _err "Ollama not running via systemd" ;;
     qdrant)   docker logs -f qdrant 2>/dev/null || _err "Qdrant logs not available" ;;
     *)        _err "Unknown service: $svc (use: voice, frontend, ollama, qdrant)" ;;
   esac
@@ -307,20 +414,23 @@ case "${1:-start}" in
   stop)     _stop ;;
   restart)  _stop; sleep 2; _start ;;
   status)   _status ;;
+  free)     _free "${2:-}" ;;
   logs)     _logs "${2:-voice}" ;;
   -h|--help|help)
-    echo "Usage: vox [start|stop|restart|status|logs [service]]"
+    echo "Usage: vox [start|stop|restart|status|free|logs [service]]"
     echo ""
     echo "Commands:"
-    echo "  start     Start all services (default, skips what's already up)"
-    echo "  stop      Stop all VoxStation services"
-    echo "  restart   Stop then start"
-    echo "  status    Show service status"
-    echo "  logs      Tail logs (voice|frontend|ollama|qdrant)"
+    echo "  start        Start all services (default)"
+    echo "  stop         Stop VoxStation services"
+    echo "  restart      Stop then start"
+    echo "  status       Show services + VRAM state"
+    echo "  free         Free VRAM: stop voice, evict models, show GPU hogs"
+    echo "  free all     Also stop Open WebUI containers (full VRAM clear)"
+    echo "  logs         Tail logs (voice|frontend|ollama|qdrant)"
     ;;
   *)
     _err "Unknown command: $1"
-    echo "Usage: vox [start|stop|restart|status|logs [service]]"
+    echo "Usage: vox [start|stop|restart|status|free|logs [service]]"
     exit 1
     ;;
 esac
