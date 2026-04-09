@@ -47,44 +47,65 @@ Voice-enabled AI chat system running entirely on local hardware. Speak to your A
 
 ---
 
+## ⚠️ The Framestation Runs Multiple GPU Services
+
+This machine runs VoxStation alongside other services that **also use the GPU**:
+
+| Service | Port | GPU | Notes |
+|---|---|---|---|
+| VoxStation Voice | 8020 | ~7.8 GiB | Whisper + Chatterbox |
+| Open WebUI (business) | 3000 | Up to 24+ GiB | Can load local models |
+| Open WebUI (family) | 3002 | Up to 24+ GiB | Can load local models |
+| Evergreen Vault | 5432/9000 | None | Postgres + MinIO |
+| n8n | 5678 | None | Automation |
+| Qdrant | 6333 | None | Vector DB |
+
+**Before debugging any VoxStation GPU issue, always run:**
+```bash
+nvidia-smi pmon -c 1 -s m
+```
+This shows EVERY process using GPU memory on the whole machine. If you see a `python` process holding 20+ GiB that isn't yours, that's your problem — not VoxStation.
+
+---
+
 ## VRAM Budget — Read This First
 
-The RTX PRO 4500 has 31.37 GiB of VRAM. Every service that uses the GPU competes for this pool. Exceeding it causes CUDA OOM errors that silently kill voice synthesis and transcription.
+The RTX PRO 4500 has 31.37 GiB of VRAM. Every service that uses the GPU competes for this pool.
 
 | Service | VRAM Used | Notes |
 |---|---|---|
 | Whisper large-v2 (CUDA) | ~3.0 GiB | CTranslate2 |
 | Chatterbox TTS (CUDA) | ~4.8 GiB | PyTorch nightly |
 | **Voice service total** | **~7.8 GiB** | Both loaded at startup |
-| llama3.2:3b | ~2.0 GiB | Recommended LLM |
+| llama3.2:3b | ~2.0 GiB | ✅ Recommended LLM |
 | llama3.2:8b | ~5.5 GiB | Good quality ceiling |
-| nemotron-3-nano:30b | ~24.0 GiB | ⚠️ Fills nearly entire GPU |
+| nemotron-3-nano:30b | ~24.0 GiB | ❌ Never fits alongside voice service |
 | nomic-embed-text | ~0.3 GiB | Required for RAG |
 | **Safe headroom target** | **~2 GiB free** | Prevents OOM on large inputs |
 
-**Maximum safe LLM with full voice service active: ~19 GiB** (31.37 - 7.8 - 2 headroom - 0.3 embeddings).
+**Rule:** Model VRAM + 8 GiB (voice) + 2 GiB (headroom) must stay under 31 GiB. Max safe LLM: ~21 GiB.
 
-### Why CUDA OOM happens silently
+**`nemotron-3-nano:30b` will never work on this machine with the voice service running.** It's 24 GiB — too large by design.
 
-When Ollama loads a model, it stays in VRAM for `KEEP_ALIVE` minutes (default: 5) even after the request finishes. If you tried a large model that failed, it may still occupy VRAM. Symptoms: voice synthesis and transcription both return 500, GPU shows near-zero free VRAM, chat still works.
+### VRAM Diagnostic Commands
 
-**Diagnose:**
 ```bash
+# Quick free/used snapshot
 nvidia-smi --query-gpu=memory.free,memory.used --format=csv
-# Check what Ollama has loaded
-curl http://127.0.0.1:11434/api/ps
-```
 
-**Fix — evict a specific model:**
-```bash
+# ALL processes using GPU on the whole machine (most important command)
+nvidia-smi pmon -c 1 -s m
+
+# What Ollama specifically has loaded
+curl -sf http://127.0.0.1:11434/api/ps | python3 -c \
+  "import sys,json; [print(m['name'], round(m.get('size_vram',0)/1e9,2),'GB') for m in json.load(sys.stdin).get('models',[])] or print('nothing loaded')"
+
+# Evict a specific model from Ollama VRAM
 curl -X POST http://127.0.0.1:11434/api/generate \
-  -d '{"model":"nemotron-3-nano:30b","keep_alive":0,"prompt":""}'
-```
+  -d '{"model":"MODEL_NAME","keep_alive":0,"prompt":""}'
 
-**Fix — nuclear option:**
-```bash
-vox stop && vox start
-# Ollama starts fresh with nothing in VRAM
+# Kill an external process holding VRAM
+sudo kill -9 <PID>   # get PID from nvidia-smi pmon
 ```
 
 ---
@@ -120,22 +141,41 @@ After any `git pull` that changes `vox`:
 sudo cp ~/VoxStation/vox /usr/local/bin/vox
 ```
 
-Forgetting this means `vox` silently runs old code. This has caused multiple debugging sessions.
+Forgetting this means `vox` silently runs old code.
 
 ---
 
-## Prerequisites — Pull These Before First Run
+## Prerequisites — Do This Before First Run
 
 ```bash
-# LLM (required)
+# 1. LLM (required)
 ollama pull llama3.2:3b
 
-# Embeddings for RAG (required — without this, every chat logs "Embedding generation failed")
+# 2. Embeddings for RAG (required — without this, every chat logs "Embedding generation failed" silently)
 ollama pull nomic-embed-text
 
-# Verify both are present
+# 3. Create .env.local (required — without it, chat defaults to nemotron-3-nano:30b which causes OOM)
+echo "OLLAMA_MODEL=llama3.2:3b" > ~/VoxStation/.env.local
+
+# 4. Verify
 ollama list
+cat ~/VoxStation/.env.local
 ```
+
+---
+
+## Route Timeout Reference
+
+Every API route that calls a model **must** have `export const maxDuration`. Next.js defaults to 10 seconds in production — not enough for any model inference.
+
+| Route | maxDuration | Why |
+|---|---|---|
+| `app/api/chat/route.ts` | 120 | LLM first-load can take 10-30s |
+| `app/api/voice/synthesize/route.ts` | 60 | TTS takes 1-40s depending on text |
+| `app/api/voice/clone/route.ts` | 60 | Upload + ffmpeg conversion |
+| `app/api/transcribe/route.ts` | 60 | Whisper on long audio |
+
+If chat or voice returns a 500 after almost exactly 10 seconds, the route is missing `maxDuration`.
 
 ---
 
@@ -147,8 +187,6 @@ ollama list
 cd ~/VoxStation/voice-service
 docker build -t voxstation-voice .
 ```
-
-First build ~10-15 minutes. Subsequent builds use cache (~2 minutes unless Dockerfile changes).
 
 ### 2. Start everything
 
@@ -163,27 +201,17 @@ Loading Whisper large-v2 on cuda (float16)...
 Whisper large-v2 loaded on cuda (float16)
 Loading Chatterbox TTS on cuda...
 Chatterbox TTS loaded on cuda
-VoxStation Voice Service ready on port 8020
 Application startup complete.
 ```
 
-### 3. Build and start the frontend
-
-```bash
-cd ~/VoxStation
-npm run build
-npm start
-# OR just: vox start (it handles this too)
-```
-
-### 4. Open in browser
+### 3. Open in browser
 
 `http://192.168.4.176:3050`
 
-For microphone access over HTTP, add the IP to Chrome's insecure origins:
+For microphone access over HTTP, add to Chrome's insecure origins:
 `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
 
-### 5. Clone your voice
+### 4. Clone your voice
 
 Go to `/clone`, record 10-30s of clear speech, name it, click Clone.
 
@@ -197,9 +225,8 @@ sudo cp ~/VoxStation/vox /usr/local/bin/vox   # if vox changed
 
 vox stop
 docker rm voxstation_voice
-docker rmi voxstation-voice   # skip if only Python files changed, not Dockerfile
+docker rmi voxstation-voice   # skip if only Python files changed
 docker build -t voxstation-voice voice-service/
-npm run build                 # if any Next.js files changed
 vox start
 vox logs voice
 ```
@@ -216,195 +243,291 @@ sudo systemctl restart docker
 
 ### CachyOS `no-cgroups` Bug
 
-The default `/etc/nvidia-container-runtime/config.toml` has `no-cgroups = true` on CachyOS, which silently strips GPU access from containers. `docker inspect` shows `DeviceRequests: null`.
+Default `/etc/nvidia-container-runtime/config.toml` has `no-cgroups = true` on CachyOS — silently strips GPU from containers.
 
-**Fix:**
 ```toml
 # /etc/nvidia-container-runtime/config.toml
 no-cgroups = false
 ```
 Then `sudo systemctl restart docker`.
 
-### Verify GPU passthrough
-
-```bash
-docker run --rm --gpus all nvidia/cuda:12.8.0-runtime-ubuntu22.04 nvidia-smi
-docker inspect voxstation_voice | grep -A 5 DeviceRequests
-```
-
 ---
 
-## Blackwell (sm_120) GPU — Status FULLY SOLVED ✅
+## Blackwell (sm_120) — FULLY SOLVED ✅
 
 | Component | Status |
 |---|---|
-| Docker GPU passthrough | ✅ NVIDIA Container Toolkit + no-cgroups fix |
-| GPU clocks 1933 MHz via OCuLink | ✅ nvidia-smi lock in vox script |
-| Ollama LLM | ✅ llama.cpp has its own CUDA path |
-| Whisper STT (CTranslate2) | ✅ CTranslate2 natively supports sm_120 |
-| Chatterbox TTS (PyTorch) | ✅ Solved April 9 2026 — nightly 2.12.0.dev20260408+cu128 |
+| Docker GPU passthrough | ✅ |
+| GPU clocks 1933 MHz via OCuLink | ✅ |
+| Ollama LLM inference | ✅ |
+| Whisper STT (CTranslate2) | ✅ Native sm_120 |
+| Chatterbox TTS (PyTorch) | ✅ Nightly 2.12.0.dev20260408+cu128 |
 
 **PyTorch arch list confirmed:** `['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']`
 
-**How TTS was solved:** `chatterbox-tts` 0.1.0–0.1.7 hard-pins `torchaudio==2.6.0`, forcing `torch==2.6.0+cu124` (no sm_120). Fix: install chatterbox with `--no-deps` to bypass the pin, install PyTorch nightly cu128 first. Full Dockerfile in `voice-service/Dockerfile`.
+**How TTS was solved:** `chatterbox-tts` hard-pins `torchaudio==2.6.0`, forcing `torch==2.6.0+cu124` (no sm_120). Fix: install with `--no-deps` to bypass the pin, with PyTorch nightly cu128 installed first.
 
 ---
 
 ## Debugging Log
 
-Chronological record of what worked, what broke, and why. Use this to avoid re-investigating solved problems.
+Chronological record of every issue, its root cause, and fix. Read this before re-investigating anything.
 
 ---
 
-### Session 1 — April 2026
-
-**Goal:** Get GPU inference working for all VoxStation components on RTX PRO 4500 Blackwell.
+### Session 1 — April 7-8, 2026
 
 #### ✅ SOLVED: Docker GPU passthrough
 
-**Symptom:** `docker inspect voxstation_voice` showed `DeviceRequests: null`. GPU completely invisible inside container despite `--gpus all` in the run command.
+**Symptom:** `docker inspect voxstation_voice` showed `DeviceRequests: null`. GPU invisible inside container.
 
-**Root cause 1:** `/usr/local/bin/vox` was an old installed copy of the script that predated the `--gpus all` flag. Running `vox` was running old code silently.
+**Root cause 1:** `/usr/local/bin/vox` was an old copy without `--gpus all`. Running `vox` ran old code silently.
 **Fix:** `sudo cp ~/VoxStation/vox /usr/local/bin/vox`
 
-**Root cause 2:** `/etc/nvidia-container-runtime/config.toml` had `no-cgroups = true` (CachyOS default). This silently disables GPU passthrough.
+**Root cause 2:** `no-cgroups = true` in CachyOS container toolkit config silently disables GPU passthrough.
 **Fix:** Set `no-cgroups = false`, restart Docker.
 
 ---
 
-#### ✅ SOLVED: Whisper STT on CUDA
-
-Whisper large-v2 via CTranslate2 works on sm_120 natively. No modifications needed. Loads on `cuda (float16)` cleanly.
-
----
-
-#### ✅ SOLVED: Chatterbox TTS on CUDA
+#### ✅ SOLVED: Chatterbox TTS on Blackwell CUDA
 
 **Symptom:** `RuntimeError: CUDA error: no kernel image is available for execution on the device`
 
-**Root cause:** PyTorch stable and early nightly builds did not include sm_120 kernels. chatterbox-tts pins `torchaudio==2.6.0` exactly, forcing `torch==2.6.0+cu124` which only goes up to sm_90.
+**Root cause:** chatterbox-tts pins `torchaudio==2.6.0` exactly, forcing `torch==2.6.0+cu124` which has no sm_120 kernels. PyTorch nightly `2.12.0.dev20260408+cu128` was first build with sm_120.
 
-**What failed:**
-- cu130 nightly — still no sm_120
-- pip constraints file — `ResolutionImpossible` (chatterbox's exact pin defeats constraints)
-- Standard install order — pip silently downgrades nightly back to stable
+**Fix:** Install chatterbox with `--no-deps`, install PyTorch nightly cu128 first in Dockerfile.
 
-**What worked:** `--no-deps` install of chatterbox + nightly cu128 installed first. PyTorch `2.12.0.dev20260408+cu128` (April 8, 2026) was first build with sm_120.
+**Key learning:** Docker build cache serves stale pip layers silently. Always use `--no-cache` when changing PyTorch versions.
 
 ---
 
-#### ✅ SOLVED: TTS saving audio (TorchCodec error)
+#### ✅ SOLVED: TTS crashes on save (TorchCodec)
 
-**Symptom:** TTS generated audio successfully on CUDA (~100 it/s visible in logs) but crashed on save with: `TorchCodec is required for save_with_torchcodec`.
+**Symptom:** TTS generated audio successfully on CUDA (~100 it/s) then crashed: `TorchCodec is required for save_with_torchcodec`.
 
-**Root cause:** PyTorch nightly 2.12.0 changed `torchaudio.save()` default backend to TorchCodec, which is not installed.
+**Root cause:** PyTorch nightly 2.12.0 changed `torchaudio.save()` default backend to TorchCodec (not installed).
 
-**Fix:** Replaced `torchaudio.save()` with `soundfile.write()` in `tts_service.py`. soundfile is already installed.
-
----
-
-#### ✅ SOLVED: Next.js voice API returning 500
-
-**Symptom:** Direct curl to port 8020 worked. All `/api/voice/*` routes at port 3050 returned 500.
-
-**Root cause 1:** `voice-client.ts` had wrong fallback URL `http://192.168.4.240:8020` (wrong IP). If `VOICE_SERVICE_URL` env var wasn't loaded, all voice calls hit a nonexistent machine.
-**Fix:** Changed fallback to `http://127.0.0.1:8020`.
-
-**Root cause 2:** Next.js API routes default to 10s timeout in production. TTS takes 8-40s depending on warm/cold state. Routes were timing out silently.
-**Fix:** Added `export const maxDuration = 60` to `/api/voice/synthesize/route.ts` and `/api/voice/clone/route.ts`.
-
-**Root cause 3:** Very long LLM responses sent to TTS caused slow synthesis and degraded audio quality.
-**Fix:** Added 500-character truncation at sentence boundary in synthesize route.
-
----
-
-#### ✅ SOLVED: Ollama model not loading
-
-**Symptom:** `{"error":"llama runner process has terminated: exit status 2"}`
-
-**Root cause 1:** `nemotron-3-nano:30b` download was corrupted. The runner crashed on both GPU and CPU mode.
-**Diagnostic:** `ollama pull tinyllama && ollama run tinyllama "hi"` — tinyllama worked, proving the runner itself was fine.
-**Fix:** `ollama rm nemotron-mini && ollama pull nemotron-mini` (re-download). Alternatively switch to `llama3.2:3b` which has no known corruption issues.
-
-**Root cause 2:** `nomic-embed-text` was never pulled. Every chat request logged `Embedding generation failed` and continued without RAG context.
-**Fix:** `ollama pull nomic-embed-text`
-
----
-
-#### ⚠️ KNOWN ISSUE: CUDA OOM when large model left in VRAM
-
-**Symptom:** Voice synthesis and transcription both return 500. Frontend log shows `CUDA out of memory`. GPU has <100 MiB free despite voice service only needing ~7.8 GiB.
-
-**Root cause:** A previously attempted large model (e.g. `nemotron-3-nano:30b` at 24 GiB) occupies VRAM even after its runner crashes. Ollama's `KEEP_ALIVE=5m` keeps models loaded. The crashed model never releases VRAM.
-
-**Diagnosis:**
-```bash
-nvidia-smi --query-gpu=memory.free,memory.used --format=csv
-curl http://127.0.0.1:11434/api/ps
+**Fix:** Replaced `torchaudio.save()` with `soundfile.write()` in `tts_service.py`.
+```python
+# Before (crashes):
+torchaudio.save(buffer, wav_tensor.cpu(), self.model.sr, format="wav")
+# After (works always):
+import soundfile as sf
+wav_numpy = wav_tensor.cpu().squeeze().numpy()
+sf.write(buffer, wav_numpy, self.model.sr, format="WAV", subtype="PCM_16")
 ```
 
-**Fix — evict without restart:**
+---
+
+#### ✅ SOLVED: All /api/voice/* routes returned 500
+
+**Symptom:** Direct curl to port 8020 worked. Every Next.js voice route returned 500.
+
+**Root cause 1:** `voice-client.ts` fallback URL was `http://192.168.4.240:8020` (wrong IP). `VOICE_SERVICE_URL` env var wasn't loading, routing all calls to a nonexistent machine.
+**Fix:** Changed fallback to `http://127.0.0.1:8020`.
+
+**Root cause 2:** No `maxDuration` on synthesize/clone routes. Next.js killed them at 10s default. TTS takes 8-40s.
+**Fix:** Added `export const maxDuration = 60` to both routes.
+
+**Key learning:** Never use `localhost` — use `127.0.0.1`. Node.js resolves `localhost` to `::1` (IPv6); most services only bind `127.0.0.1`.
+
+---
+
+#### ✅ SOLVED: Ollama model corruption
+
+**Symptom:** `exit status 2` when loading nemotron-mini. Appeared on both GPU and CPU.
+
+**Diagnostic:** `ollama run tinyllama "hi"` — tinyllama worked, proving runner was fine. Model download was corrupted.
+
+**Fix:** `ollama rm nemotron-mini && ollama pull nemotron-mini` OR switch to `llama3.2:3b`.
+
+**Key learning:** When Ollama fails, always test tinyllama first. If tinyllama works, the runner is healthy — the model file is the problem.
+
+---
+
+#### ✅ SOLVED: CUDA OOM from nemotron-3-nano:30b stuck in VRAM
+
+**Symptom:** TTS and transcribe returned 500. GPU showed ~15 MiB free. Voice service never loaded.
+
+**Root cause:** nemotron-3-nano:30b (24 GiB) left in VRAM by a failed load attempt. Ollama's KEEP_ALIVE held it. Voice service needs 7.8 GiB — no room.
+
+**Fix:**
 ```bash
 curl -X POST http://127.0.0.1:11434/api/generate \
   -d '{"model":"nemotron-3-nano:30b","keep_alive":0,"prompt":""}'
 ```
 
-**Fix — full restart:**
+---
+
+#### ✅ SOLVED: RAG silently disabled
+
+**Symptom:** Every chat logged `Embedding generation failed` but returned a response. RAG context was always empty.
+
+**Root cause:** `nomic-embed-text` was never pulled.
+
+**Fix:** `ollama pull nomic-embed-text`
+
+**Key learning:** Add `nomic-embed-text` to setup prerequisites. The app should surface this as a visible warning, not a silent log.
+
+---
+
+### Session 2 — April 9, 2026
+
+**Starting state:** TTS confirmed working at service level (0.921s, valid WAV). Chat returning 500. Voice API routes returning 500. Goal: get end-to-end working.
+
+---
+
+#### ✅ SOLVED: Chat route missing maxDuration
+
+**Symptom:** Chat returned "Sorry, something went wrong" after exactly ~10 seconds every time.
+
+**Root cause:** `app/api/chat/route.ts` had no `export const maxDuration`. Same class of bug that killed synthesize/clone in Session 1, just missed during that fix.
+
+**Fix:**
 ```bash
+sed -i '1s/^/export const maxDuration = 120;\n/' ~/VoxStation/app/api/chat/route.ts
+```
+
+**Key learning:** Every single route that touches a model needs maxDuration. Make it a checklist item after adding any new API route.
+
+---
+
+#### ✅ SOLVED: .env.local missing — chat defaulted to nemotron-3-nano:30b
+
+**Symptom:** After fixing maxDuration, chat still failed with `llama runner process has terminated: exit status 2`.
+
+**Root cause:** `.env.local` didn't exist on this machine. `chat/route.ts` line 6:
+```typescript
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "nemotron-3-nano:30b";
+```
+With no `.env.local`, every chat attempt tried to load the 24 GiB model — immediate OOM.
+
+**Fix:**
+```bash
+echo "OLLAMA_MODEL=llama3.2:3b" > ~/VoxStation/.env.local
 vox stop && vox start
 ```
 
-**Prevention:** Stick to models under 19 GiB when voice service is running. `llama3.2:3b` (2 GiB) is the recommended default. `llama3.2:8b` (5.5 GiB) is the quality ceiling with comfortable headroom.
+**Key learning:** The hardcoded fallback `|| "nemotron-3-nano:30b"` is a trap. It should be changed to `|| "llama3.2:3b"` in the source so a missing `.env.local` doesn't cause OOM. Also: always verify `.env.local` exists as a setup step.
+
+---
+
+#### ✅ SOLVED: External Python process holding 23 GiB VRAM — the real OOM culprit
+
+**Symptom:** After `vox stop`, `docker rm voxstation_voice`, `sudo pkill -9 ollama` — VRAM still showed 23,160 MiB used. `ollama run llama3.2:3b` failed with exit status 2 even though it only needs 2 GiB.
+
+**Diagnosis:**
+```bash
+nvidia-smi pmon -c 1 -s m
+# Output:
+# gpu   pid   type   fb    command
+#   0   360938   C   23150   python
+```
+A Python process (PID 360938) outside VoxStation was holding 23 GiB. Identified as likely **Open WebUI** (`webui_business` or `webui_family` container on :3000/:3002) running a local model.
+
+**Fix:**
+```bash
+sudo kill -9 360938
+nvidia-smi --query-gpu=memory.free,memory.used --format=csv
+# → 23+ GiB freed immediately
+vox start
+ollama run llama3.2:3b "say hello"  # works
+```
+
+**Key lesson — most important one in this log:**
+`nvidia-smi pmon -c 1 -s m` shows every process using GPU memory on the whole machine. When VRAM looks full after killing all your own services, run this command first. Don't restart VoxStation repeatedly — find the external process.
+
+**Permanent fix:** Stop competing GPU services before running VoxStation:
+```bash
+docker stop webui_business webui_family
+vox start
+```
+Or configure Open WebUI instances to not use local GPU models.
+
+---
+
+#### ✅ SOLVED: llama3.2:3b not pulled
+
+**Symptom:** After fixing .env.local, chat failed with `model 'llama3.2:3b' not found`.
+
+**Root cause:** The model was referenced but never downloaded.
+
+**Fix:** `ollama pull llama3.2:3b` (~2 GB, ~3 minutes)
+
+---
+
+#### ✅ CONFIRMED WORKING: End-to-end chat — April 9, 2026
+
+With external process killed, llama3.2:3b pulled, .env.local set, and maxDuration added:
+- Chat API responds correctly ✅
+- TTS synthesizes at 0.921s via curl ✅  
+- John voice profile with 4 samples exists ✅
+- nomic-embed-text loaded for RAG ✅
+
+---
+
+#### ⚠️ IN PROGRESS: Voice audio not playing in browser
+
+**Symptom:** TTS confirmed working at service level. Browser receives audio bytes but nothing plays.
+
+**Likely cause:** Browser autoplay policy. Chrome blocks `audio.play()` called outside a user gesture. Error: `NotAllowedError: play() failed because the user didn't interact with the document first` — appears silently in DevTools console, not in the app UI.
+
+**Fix options:**
+1. Add a speaker button (🔊) per assistant message — play() inside click handler is always allowed
+2. Queue audio, flush on next user click/keypress
+
+**Test in DevTools console:**
+```javascript
+new Audio().play().then(() => console.log('autoplay OK')).catch(e => console.log('BLOCKED:', e.message))
+```
 
 ---
 
 ## Known Issues and Lessons Learned
 
+### The VRAM Check Order of Operations
+
+When anything GPU-related breaks, check in this exact order:
+1. `nvidia-smi pmon -c 1 -s m` — is something external eating VRAM?
+2. `nvidia-smi --query-gpu=memory.free,memory.used --format=csv` — how much is free?
+3. `curl -sf http://127.0.0.1:11434/api/ps` — what does Ollama have loaded?
+4. `docker logs voxstation_voice --tail 30` — what is the voice service saying?
+
+Skipping step 1 has cost multiple debugging sessions.
+
+### pnpm Not in PATH via SSH
+
+`pnpm` is installed but not in the PATH of non-interactive SSH shells. `pnpm build` will fail. `vox start` runs Next.js from the pre-built `.next` directory — changes to `.env.local` and API routes take effect on `vox stop && vox start` without a full rebuild in many cases.
+
+To find pnpm for a manual rebuild:
+```bash
+find / -name pnpm -type f 2>/dev/null | grep -v proc | head -5
+```
+
 ### Node.js IPv6 Resolution
 
-`fetch("http://localhost:...")` resolves to `::1` (IPv6). Ollama and other services only bind `127.0.0.1`. Connections hang silently.
-
-**Fix:** Always use `127.0.0.1` in `.env`, never `localhost`.
+`fetch("http://localhost:...")` resolves to `::1` (IPv6). Use `127.0.0.1` in `.env` and all hardcoded URLs.
 
 ### Docker Build Cache Hides Stale Packages
 
-`docker rmi` removes the image tag but not the build cache. `pip install` layers serve from cache. You can be running old torch versions without knowing it.
-
-**Fix:** Use `--no-cache` when you need a fresh install:
+`docker rmi` removes the image tag but not the build cache. Use `--no-cache` when changing PyTorch versions:
 ```bash
 docker build --no-cache -t voxstation-voice voice-service/
 ```
 
-**Verify torch in the container:**
+### Verify torch inside the container:
 ```bash
 docker run --rm --gpus all voxstation-voice python3 -c \
   "import torch; print(torch.__version__); print(torch.cuda.get_arch_list())"
 ```
 
-### Docker Compose Ghost Containers
+### Coil Whine from GPU
 
-`docker compose up` can fail with "No such container" after `docker compose down`. Corrupted internal state.
-
-**Fix:** Use `docker run` directly via the vox script.
-
-### CachyOS Firewall
-
-Blocks LAN connections by default:
-```bash
-sudo iptables -I INPUT -p tcp --dport 3050 -j ACCEPT
-```
-
-### Whisper CPU Compute Type
-
-CPU does not support float16. Set `VOXSTATION_WHISPER_COMPUTE_TYPE=int8` when running Whisper on CPU. The config auto-detects this.
+Faint screeching under varying load is normal — electromagnetic vibration from PCB inductors. Not harmful.
 
 ### HuggingFace 503 Outages
 
-Model downloads fail with `LocalEntryNotFoundError` during HF outages. Restart the container once HF recovers. Long-term: pre-cache models and set `HF_HUB_OFFLINE=1`.
-
-### Coil Whine from GPU
-
-A faint screeching sound from the GPU under varying load is **normal** — electromagnetic vibration from inductors on the PCB. Not harmful.
+Model downloads fail with `LocalEntryNotFoundError` during HF outages. Restart container once HF recovers.
 
 ---
 
@@ -448,11 +571,20 @@ POST /voices/clone → { id, name, sample_saved }
 ## Development Commands
 
 ```bash
-# Full system health check
-vox status
-curl http://127.0.0.1:8020/health
-curl http://127.0.0.1:11434/api/ps          # what's loaded in Ollama VRAM
+# Full VRAM picture — run this first when anything breaks
+nvidia-smi pmon -c 1 -s m
 nvidia-smi --query-gpu=memory.free,memory.used --format=csv
+
+# What Ollama has loaded in VRAM
+curl -sf http://127.0.0.1:11434/api/ps | python3 -c \
+  "import sys,json; [print(m['name'], round(m.get('size_vram',0)/1e9,2),'GB') for m in json.load(sys.stdin).get('models',[])] or print('nothing loaded')"
+
+# Evict a model from Ollama VRAM immediately
+curl -X POST http://127.0.0.1:11434/api/generate \
+  -d '{"model":"MODEL_NAME","keep_alive":0,"prompt":""}'
+
+# Kill an external VRAM hog
+sudo kill -9 <PID>   # get PID from nvidia-smi pmon
 
 # Test TTS directly (bypasses Next.js)
 curl -X POST http://127.0.0.1:8020/synthesize \
@@ -467,15 +599,12 @@ curl -X POST http://127.0.0.1:3050/api/voice/synthesize \
   -d '{"text":"hello","voice_id":"john"}' \
   --output /tmp/test.wav -w "\nHTTP: %{http_code} | Time: %{time_total}s\n"
 
-# View frontend error log
-tail -50 ~/VoxStation/.vox-frontend.log
+# Voice service health
+curl http://127.0.0.1:8020/health
 
-# View voice service logs
+# View logs
 vox logs voice
-
-# Evict a model from Ollama VRAM
-curl -X POST http://127.0.0.1:11434/api/generate \
-  -d '{"model":"MODEL_NAME","keep_alive":0,"prompt":""}'
+tail -50 ~/VoxStation/.vox-frontend.log
 
 # Verify torch inside container
 docker run --rm --gpus all voxstation-voice python3 -c \
