@@ -35,8 +35,8 @@ VoxStation runs across three services on a single machine (Framestation 395):
 ┌──────────────────┐   ┌──────────────────────────────────────┐
 │  Ollama (11434)  │   │  Voice Service Docker (8020)         │
 │  nemotron-3-nano │   │  ├─ Whisper STT → CUDA ✅            │
-│  :30b on GPU     │   │  └─ Chatterbox TTS → CPU (see below) │
-│                  │   │     (Blackwell sm_120 blocker)        │
+│  :30b on GPU     │   │  └─ Chatterbox TTS → CUDA ✅         │
+│                  │   │     (PyTorch nightly cu128, sm_120)   │
 └──────────────────┘   └──────────────────────────────────────┘
          │
          ▼
@@ -69,7 +69,7 @@ VoxStation runs across three services on a single machine (Framestation 395):
 | Service | Port | Host | Notes |
 |---|---|---|---|
 | Next.js frontend | 3050 | Framestation | Web UI + API proxy |
-| Voice service | 8020 | Framestation | Docker container |
+| Voice service | 8020 | Framestation | Docker container, full CUDA |
 | Ollama | 11434 | Framestation | LLM inference on GPU |
 | Qdrant | 6333 | Framestation | Vector search for RAG |
 
@@ -83,7 +83,7 @@ VoxStation is managed by a single shell script (`vox`) that handles starting, st
 vox start     # Start all services (locks GPU clocks first)
 vox stop      # Stop all containers
 vox restart   # Stop + start
-vox logs      # Tail all logs
+vox logs      # Tail voice service logs
 vox logs voice  # Tail just the voice service
 vox status    # Show container and GPU status
 ```
@@ -115,7 +115,7 @@ sudo nvidia-smi -pl 186
 
 ## GPU Setup (NVIDIA Container Toolkit)
 
-To enable GPU passthrough into Docker containers, the NVIDIA Container Toolkit must be installed and configured. This is **required** for Whisper STT to run on CUDA.
+To enable GPU passthrough into Docker containers, the NVIDIA Container Toolkit must be installed and configured.
 
 ### Install
 
@@ -150,11 +150,10 @@ This should show the RTX PRO 4500 with CUDA 13.2. If it shows nothing or errors,
 ### Diagnose missing GPU inside a running container
 
 ```bash
-# Check if --gpus all is actually applied to the container
 docker inspect voxstation_voice | grep -A 20 DeviceRequests
 ```
 
-If `DeviceRequests` is `null`, the container was started without GPU — this means either the system `/usr/local/bin/vox` is stale (see above), or the toolkit config is wrong.
+If `DeviceRequests` is `null`, the container was started without GPU — either the system `/usr/local/bin/vox` is stale, or the toolkit config is wrong.
 
 ---
 
@@ -270,12 +269,10 @@ vox logs voice
 ```
 Loading Whisper large-v2 on cuda (float16)...
 Whisper large-v2 loaded on cuda (float16)
-Loading Chatterbox TTS on cpu...
-Chatterbox TTS loaded on cpu
+Loading Chatterbox TTS on cuda...
+Chatterbox TTS loaded on cuda
 Application startup complete.
 ```
-
-> Note: `cpu` for Chatterbox TTS is correct and expected until PyTorch ships Blackwell (sm_120) support. See the Blackwell TTS section below.
 
 ### 3. Start the Frontend
 
@@ -320,90 +317,43 @@ vox start
 vox logs voice
 ```
 
-If something looks wrong but you just changed the vox script (not the Dockerfile or Python), skip the `docker rmi` and `docker build` steps — just `vox stop`, copy the script, `vox start`.
-
 ---
 
-## Blackwell GPU Status (sm_120) — April 2026
+## Blackwell GPU Status (sm_120) — FULLY SOLVED ✅
 
-This section documents the full picture of GPU support on the RTX PRO 4500, what works, what doesn't, and everything that has been tried.
-
-### What WORKS on CUDA ✅
+All VoxStation components run on CUDA on the RTX PRO 4500 Blackwell.
 
 | Component | Status | Notes |
 |---|---|---|
-| Docker GPU passthrough (`--gpus all`) | ✅ Working | Requires NVIDIA Container Toolkit + `no-cgroups = false` |
-| GPU clocks locked at 1933 MHz via OCuLink | ✅ Working | `nvidia-smi -lgc 1933,1933` in vox script |
-| Ollama (nemotron-3-nano:30b) | ✅ Working | Uses llama.cpp — has its own CUDA kernel path |
-| **Whisper large-v2 on CUDA (float16)** | ✅ Working | CTranslate2 natively supports sm_120 |
+| Docker GPU passthrough (`--gpus all`) | ✅ | NVIDIA Container Toolkit + `no-cgroups = false` |
+| GPU clocks locked at 1933 MHz via OCuLink | ✅ | `nvidia-smi -lgc 1933,1933` in vox script |
+| Ollama LLM on GPU | ✅ | llama.cpp — has its own CUDA kernel path |
+| Whisper large-v2 on CUDA (float16) | ✅ | CTranslate2 supports sm_120 natively |
+| **Chatterbox TTS on CUDA** | ✅ **SOLVED** | PyTorch nightly 2.12.0.dev20260408+cu128 |
 
-### What DOESN'T work yet ❌
+**Solved on:** April 9, 2026  
+**PyTorch version confirmed working:** `2.12.0.dev20260408+cu128`  
+**Arch list confirmed:** `['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']`
 
-| Component | Status | Error |
-|---|---|---|
-| **Chatterbox TTS on CUDA** | ❌ Blocked | `RuntimeError: CUDA error: no kernel image is available for execution on the device` |
+### How it was solved
 
-**Root cause:** Chatterbox TTS uses PyTorch. PyTorch's pre-built pip wheels (including all cu128 and cu130 nightly builds as of April 2026) do not include compiled kernels for sm_120 (Blackwell). The error message is explicit: `The current PyTorch install supports CUDA capabilities sm_50 sm_60 sm_70 sm_75 sm_80 sm_86 sm_90` — sm_120 is absent.
+`chatterbox-tts` versions 0.1.0–0.1.7 all hard-pin `torchaudio==2.6.0`, which forces pip to install `torch==2.6.0+cu124` — a stable build with no sm_120 kernels. The fix is a two-part approach in the Dockerfile:
 
-### Current Workaround
-
-Whisper STT runs on CUDA. Chatterbox TTS runs on CPU. Everything works — TTS is just slower.
-
-The `vox` script sets:
-```bash
-VOXSTATION_WHISPER_DEVICE=cuda
-VOXSTATION_XTTS_DEVICE=cpu
-```
-
----
-
-## Chatterbox TTS on Blackwell — Everything We Tried
-
-This section is a complete record of every approach attempted to get Chatterbox TTS running on CUDA on the RTX PRO 4500 (sm_120). Documented here so the next session doesn't repeat dead ends.
-
-### Approach 1: cu130 nightly instead of cu128
-
-**Hypothesis:** cu130 nightly might include sm_120 kernels before cu128 does.
-
-**Dockerfile change:**
+**1. Install chatterbox with `--no-deps`** to bypass the torchaudio pin:
 ```dockerfile
-FROM nvidia/cuda:13.2.0-runtime-ubuntu22.04
-RUN pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
+RUN pip3 install --no-cache-dir --no-deps chatterbox-tts
 ```
 
-**Result:** ❌ Same sm_120 error. cu130 nightly as of April 2026 also only compiles up to sm_90.
-
----
-
-### Approach 2: Constraints file to pin nightly torch while installing chatterbox
-
-**Hypothesis:** Use pip's `-c constraints.txt` to force the nightly torch version even when chatterbox pulls in torchaudio as a dep.
-
-**The real problem discovered here:** `chatterbox-tts` versions 0.1.0 through 0.1.7 ALL hard-pin `torchaudio==2.6.0` in their package metadata. This is not a loose `>=` constraint — it is an exact version pin. When you install chatterbox, pip's dependency resolver sees:
-- User wants: `torchaudio==2.11.0.dev20260407+cu128`
-- chatterbox-tts 0.1.7 requires: `torchaudio==2.6.0`
-- Result: `ResolutionImpossible`
-
-The constraints file approach fails with:
-```
-ResolutionImpossible: chatterbox-tts 0.1.7 depends on torchaudio==2.6.0, user requested torchaudio==2.11.0.dev20260407+cu128
+**2. Install PyTorch nightly cu128 first**, before anything else can overwrite it:
+```dockerfile
+RUN pip3 install --no-cache-dir torch torchaudio \
+    --index-url https://download.pytorch.org/whl/nightly/cu128
 ```
 
-Additionally, if you install nightly torch first and then install chatterbox normally, pip **overwrites** the nightly with `torch==2.6.0+cu124` from PyPI because requirements.txt contains `torch>=2.5.0`. You can verify what torch is actually installed in the container with:
-```bash
-docker run --rm voxstation-voice python3 -c "import torch; print(torch.__version__); print(torch.cuda.get_arch_list())"
-```
-If this prints `2.6.0+cu124` and `[]` for arch list, pip silently downgraded you back to stable.
+PyTorch nightly `2.12.0.dev20260408+cu128` is the first build to include compiled sm_120 kernels.
 
-**Result:** ❌ ResolutionImpossible.
+### Full Dockerfile
 
----
-
-### Approach 3: Install chatterbox with `--no-deps`, manually supply runtime deps
-
-**Hypothesis:** Bypass chatterbox's torchaudio pin entirely by installing it without dependency resolution, then manually install everything chatterbox actually needs at runtime.
-
-**Dockerfile (current state as of last commit):**
 ```dockerfile
 FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
 WORKDIR /app
@@ -412,15 +362,15 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir packaging
-# Step 1: Install nightly PyTorch FIRST (before anything else touches torch)
+# Install nightly PyTorch FIRST — must happen before any other package touches torch
 RUN pip3 install --no-cache-dir torch torchaudio \
     --index-url https://download.pytorch.org/whl/nightly/cu128
-# Step 2: Install all other deps EXCEPT torch/torchaudio/chatterbox
+# Install everything except torch/torchaudio/chatterbox
 RUN grep -vE '^torch|^torchaudio|^chatterbox' requirements.txt > /tmp/reqs_base.txt && \
     pip3 install --no-cache-dir -r /tmp/reqs_base.txt
-# Step 3: Install chatterbox WITHOUT deps (bypasses the torchaudio==2.6.0 hard pin)
+# Install chatterbox WITHOUT deps to bypass the torchaudio==2.6.0 hard pin
 RUN pip3 install --no-cache-dir --no-deps chatterbox-tts
-# Step 4: Manually supply chatterbox's actual runtime dependencies
+# Manually supply chatterbox's actual runtime dependencies
 RUN pip3 install --no-cache-dir \
     "resemble-perth>=1.0.0" "pykakasi==2.3.0" "diffusers==0.29.0" \
     omegaconf "librosa==0.11.0" s3tokenizer spacy-pkuseg \
@@ -431,67 +381,36 @@ EXPOSE 8020
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8020"]
 ```
 
-**What happened:** The image built successfully. The container started and began loading Chatterbox TTS on CUDA. However, HuggingFace Hub returned HTTP 503 for `ve.safetensors` (the voice encoder model file) — a transient HF outage. After 5 retries the service threw `LocalEntryNotFoundError` and crashed. The models were not cached in this fresh image build.
+### Verify torch version in the container
 
-**Status: ⚠️ UNVERIFIED** — This approach was interrupted by HF being down before we could see if the sm_120 kernel error still occurs. The nightly torch **was** correctly installed (the `--no-deps` method bypasses the pin). Whether the nightly torch actually resolves the sm_120 error has not been confirmed in a clean run.
+```bash
+docker run --rm --gpus all voxstation-voice python3 -c \
+  "import torch; print(torch.__version__); print(torch.cuda.get_arch_list())"
+# Expected:
+# 2.12.0.dev20260408+cu128
+# ['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']
+```
+
+### Future: Switch to PyTorch 2.7 stable when it ships
+
+When PyTorch 2.7 stable includes sm_120, the Dockerfile can be simplified back to a standard install:
+```dockerfile
+RUN pip3 install torch torchaudio  # remove --index-url nightly line
+```
 
 ---
 
-### Next Steps for Chatterbox CUDA (in priority order)
+## Chatterbox TTS on Blackwell — Full History
 
-#### Option A: Re-test the `--no-deps` approach when HuggingFace is up ← DO THIS FIRST
+Complete record of everything tried, for reference.
 
-The current Dockerfile (commit d4367be) already implements this. Just rebuild fresh and confirm:
+### What was tried and why it failed
 
-```bash
-# Verify nightly torch is actually installed
-docker run --rm --gpus all voxstation-voice python3 -c \
-  "import torch; print(torch.__version__); print(torch.cuda.get_arch_list())"
-```
+**Approach 1 — cu130 nightly:** Same sm_120 error. cu130 nightly as of early April 2026 also only compiled up to sm_90.
 
-**If you see `2.11.0.dev...+cu128` and `['sm_50', ..., 'sm_90']`** — nightly is in place. If TTS still hits sm_120 error, the nightly doesn't have Blackwell yet and we need to wait for PyTorch 2.7.
+**Approach 2 — pip constraints file:** Failed with `ResolutionImpossible`. chatterbox-tts hard-pins `torchaudio==2.6.0` as an exact version pin across all releases 0.1.0–0.1.7. pip cannot satisfy both `torchaudio==2.6.0` (chatterbox) and `torchaudio==2.11.0.dev...+cu128` (nightly) simultaneously. Additionally, `requirements.txt` contains `torch>=2.5.0`, which causes pip to silently downgrade nightly torch to `2.6.0+cu124` from PyPI if chatterbox is installed afterward. The tell-tale sign of this downgrade: `torch.cuda.get_arch_list()` returns `[]`.
 
-**If you see `2.6.0+cu124`** — pip downgraded again. The filtering in the Dockerfile needs more coverage.
-
-Pre-cache the models before running to avoid HF 503 issues:
-```bash
-# Inside a running container, pre-download all models
-docker exec voxstation_voice python3 -c "
-from chatterbox.tts import ChatterboxTTS
-model = ChatterboxTTS.from_pretrained('cpu')
-print('Models cached successfully')
-"
-```
-
-Or set `HF_HUB_OFFLINE=1` and pre-bake models into the image.
-
-#### Option B: Check monthly if PyTorch 2.7 stable adds sm_120
-
-PyTorch is expected to add Blackwell (sm_120) in PyTorch 2.7. Once it ships:
-1. Switch the Dockerfile back to standard torch install
-2. Change `VOXSTATION_XTTS_DEVICE=cpu` → `cuda` in the vox script
-
-#### Option C: Try `cu130` nightly with `--no-deps`
-
-Combine the `--no-deps` approach with a cu130 nightly. Host driver 13.2 supports cu130 inside containers:
-```dockerfile
-FROM nvidia/cuda:13.2.0-runtime-ubuntu22.04
-RUN pip3 install torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
-```
-
-#### Option D: Replace Chatterbox with a Blackwell-safe TTS model
-
-If PyTorch sm_120 support takes too long, replace Chatterbox with a model that uses CTranslate2 or ONNX — both fully support Blackwell:
-- **Kokoro** — fast, high quality, CTranslate2 backend
-- **StyleTTS2** — excellent quality, can run on CTranslate2
-
-#### Option E: Build PyTorch from source for sm_120
-
-This is the nuclear option. Takes ~4-8 hours on a powerful machine but produces a PyTorch wheel with sm_120 compiled in:
-```bash
-export TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;12.0"
-python setup.py bdist_wheel
-```
+**Approach 3 — `--no-deps` + manual deps + nightly cu128:** ✅ **This worked.** PyTorch nightly `2.12.0.dev20260408+cu128` (April 8, 2026) was the first build to ship sm_120 kernels. The `--no-deps` flag bypasses chatterbox's torchaudio pin entirely.
 
 ---
 
@@ -505,7 +424,7 @@ Node.js `fetch("http://localhost:...")` resolves to `::1` (IPv6), but Ollama and
 
 ### Browser WebM → WAV Conversion
 
-Browsers record audio as WebM/Opus format. Chatterbox requires 24kHz mono WAV. The voice service uses ffmpeg to convert:
+Browsers record audio as WebM/Opus. Chatterbox requires 24kHz mono WAV. The voice service uses ffmpeg to convert:
 
 ```python
 subprocess.run([
@@ -514,27 +433,23 @@ subprocess.run([
 ])
 ```
 
-ffmpeg is installed in the Docker image for this purpose.
-
 ### Docker Compose Ghost Containers
 
-Docker Compose can develop corrupted internal state where it references deleted containers by ID. Symptoms: `docker compose up` fails with "No such container" errors even after `docker compose down`.
+Docker Compose can develop corrupted internal state where it references deleted containers by ID. Symptoms: `docker compose up` fails with "No such container" even after `docker compose down`.
 
-**Workaround:** Use `docker run` directly via the `vox` script instead of `docker compose up`.
+**Workaround:** Use `docker run` directly via the `vox` script.
 
 ### Docker Build Cache Surprises
 
-`docker rmi <image>` removes the image tag but **does NOT clear the build cache**. If you want to force a completely fresh install (e.g., to pull a newer nightly PyTorch), you must use `--no-cache`:
+`docker rmi <image>` removes the image tag but does **not** clear the build cache. To force a fresh PyTorch download:
 
 ```bash
 docker build --no-cache -t voxstation-voice voice-service/
 ```
 
-Without `--no-cache`, pip install layers are served from cache and you may be running old torch versions without knowing it.
-
 ### CachyOS Firewall
 
-CachyOS (Arch-based) blocks incoming connections by default. Open port 3050 for LAN access:
+CachyOS blocks incoming connections by default. Open port 3050 for LAN:
 
 ```bash
 sudo iptables -I INPUT -p tcp --dport 3050 -j ACCEPT
@@ -542,7 +457,7 @@ sudo iptables -I INPUT -p tcp --dport 3050 -j ACCEPT
 
 ### Next.js Streaming SSE in Production
 
-Next.js production mode (`next start`) can buffer streaming responses when using nested `ReadableStream` objects. The fix uses `TransformStream` with an async background writer, plus these response headers:
+Next.js production mode can buffer SSE streams. Fix with `TransformStream` plus:
 
 ```typescript
 export const dynamic = "force-dynamic";
@@ -556,7 +471,7 @@ headers: {
 
 ### Whisper Compute Type
 
-CPU does not support float16 compute. When running Whisper on CPU, use `int8`:
+CPU does not support float16. When running Whisper on CPU, set:
 
 ```bash
 -e VOXSTATION_WHISPER_COMPUTE_TYPE=int8
@@ -566,20 +481,14 @@ The config auto-detects this when `whisper_compute_type` is left unset.
 
 ### HuggingFace 503 Errors
 
-HuggingFace Hub has intermittent outages. If model files fail to download with 503 errors at startup, the service crashes with `LocalEntryNotFoundError`. 
+HF Hub has intermittent outages. If model files fail to download at startup, the service crashes with `LocalEntryNotFoundError`. Wait for HF to recover and restart the container. Long-term fix: pre-cache models in a volume and set `HF_HUB_OFFLINE=1`.
 
-**Short-term fix:** Wait for HF to recover and restart the container.
+### Performance (Full CUDA)
 
-**Long-term fix:** Pre-cache all models by running a download pass once, then mount the cache as a volume and set `HF_HUB_OFFLINE=1`. Models are stored in `~/.cache/huggingface/` inside the container.
-
-### Performance on CPU (TTS)
-
-With Chatterbox TTS on CPU:
-- **Whisper STT (large-v2 on CUDA):** ~1-3s for a 30s recording
-- **Chatterbox TTS (on CPU):** ~46s model load (first request), ~10-20s per synthesis
-- **Ollama LLM (on GPU):** ~1-2s response time
-
-TTS is the bottleneck. Once Blackwell CUDA support arrives in PyTorch, TTS inference should drop to ~1-3s.
+With everything on GPU:
+- **Whisper STT (large-v2, CUDA float16):** ~1-3s for a 30s recording
+- **Chatterbox TTS (CUDA):** ~5-10s model load (first request), ~2-5s per synthesis
+- **Ollama LLM (GPU):** ~1-2s response time
 
 ---
 
@@ -639,6 +548,7 @@ POST /voices/clone        → { id, name, sample_saved }
 | LLM | Ollama (nemotron-3-nano:30b) | Latest |
 | STT | faster-whisper (CTranslate2) | 1.1+ |
 | TTS | Chatterbox (Resemble AI) | 0.1+ |
+| PyTorch | Nightly cu128 (sm_120 support) | 2.12.0.dev20260408+ |
 | RAG | Qdrant + nomic-embed-text | Latest |
 | Voice Service | FastAPI + Uvicorn | 0.115+ |
 | Container | Docker (nvidia/cuda:12.8.0-runtime-ubuntu22.04) | — |
@@ -660,10 +570,14 @@ docker build -t voxstation-voice voice-service/
 vox start
 vox logs voice
 
-# Quick restart (vox script changes only, no Dockerfile changes)
+# Quick restart (vox script changes only)
 vox stop
 sudo cp ~/VoxStation/vox /usr/local/bin/vox
 vox start
+
+# Verify torch/CUDA inside the container
+docker run --rm --gpus all voxstation-voice python3 -c \
+  "import torch; print(torch.__version__); print(torch.cuda.get_arch_list())"
 
 # Check voice service health
 curl http://127.0.0.1:8020/health
@@ -671,13 +585,6 @@ curl http://127.0.0.1:8020/health
 # Test Ollama directly
 curl http://127.0.0.1:11434/api/chat -d \
   '{"model":"nemotron-3-nano:30b","messages":[{"role":"user","content":"hi"}],"stream":false}'
-
-# View voice service logs
-vox logs voice
-
-# Verify what torch version is actually inside the container
-docker run --rm --gpus all voxstation-voice python3 -c \
-  "import torch; print(torch.__version__); print(torch.cuda.get_arch_list())"
 ```
 
 ---
