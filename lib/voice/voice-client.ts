@@ -6,7 +6,7 @@
  */
 
 const VOICE_SERVICE_URL =
-  process.env.VOICE_SERVICE_URL || "http://192.168.4.240:8020";
+  process.env.VOICE_SERVICE_URL || "http://127.0.0.1:8020";
 
 export interface TranscribeResult {
   text: string;
@@ -57,6 +57,9 @@ export async function transcribeAudio(
 /**
  * Synthesize text to speech using Chatterbox TTS.
  * Returns WAV audio as an ArrayBuffer.
+ *
+ * Note: TTS on GPU takes 5-10s. The route sets maxDuration=60 to
+ * avoid Next.js's default 10s serverless timeout.
  */
 export async function synthesizeSpeech(
   text: string,
