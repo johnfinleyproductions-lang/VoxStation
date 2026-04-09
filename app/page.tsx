@@ -6,6 +6,7 @@ import { VoiceControls } from "@/components/voice/voice-controls";
 import { StatusBar } from "@/components/layout/status-bar";
 import { Mic, Settings, Zap, UserCircle, ChevronDown } from "lucide-react";
 import Link from "next/link";
+import { StreamingTTS, extractCompleteSentences } from "@/lib/voice/streaming-tts";
 
 export interface Message {
   id: string;
@@ -35,6 +36,9 @@ export default function VoxStationPage() {
     rag: boolean;
   }>({ voice: false, ollama: false, rag: false });
 
+  // Track active TTS instance so we can stop it if user sends another message
+  const activeTTS = useRef<StreamingTTS | null>(null);
+
   // Check service health and available voices on mount
   useEffect(() => {
     async function checkHealth() {
@@ -50,7 +54,6 @@ export default function VoxStationPage() {
               sample_count: v.sample_count || 0,
             }));
             setVoices(profiles);
-            // Set default voice to first available if not set
             if (profiles.length > 0) {
               setVoiceId((current) => {
                 if (!current || !profiles.find((p: VoiceProfile) => p.id === current)) {
@@ -72,7 +75,6 @@ export default function VoxStationPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // Close voice menu when clicking outside
   useEffect(() => {
     if (!showVoiceMenu) return;
     const handleClick = () => setShowVoiceMenu(false);
@@ -81,11 +83,27 @@ export default function VoxStationPage() {
   }, [showVoiceMenu]);
 
   /**
-   * Send a text message and stream the response.
+   * Send a text message, stream the LLM response, and speak it
+   * sentence-by-sentence as the response arrives.
+   *
+   * Key: StreamingTTS is created SYNCHRONOUSLY before any await so the
+   * AudioContext is created inside the user gesture — this satisfies
+   * browser autoplay policy without needing a separate play button.
    */
   const sendMessage = useCallback(
     async (text: string) => {
       if (!text.trim() || isStreaming) return;
+
+      // Stop any previous TTS that might still be playing
+      activeTTS.current?.stop();
+      activeTTS.current = null;
+
+      // Create streaming TTS SYNCHRONOUSLY here — inside the click handler.
+      // AudioContext created now = browser allows audio playback later.
+      const tts = voiceEnabled && voiceId
+        ? new StreamingTTS(voiceId)
+        : null;
+      activeTTS.current = tts;
 
       const userMsg: Message = {
         id: crypto.randomUUID(),
@@ -96,14 +114,12 @@ export default function VoxStationPage() {
       setMessages((prev) => [...prev, userMsg]);
       setIsStreaming(true);
 
-      // Build history for Ollama
       const history = messages.map((m) => ({
         role: m.role as "user" | "assistant",
         content: m.content,
       }));
       history.push({ role: "user", content: text });
 
-      // Create placeholder for assistant response
       const assistantId = crypto.randomUUID();
       setMessages((prev) => [
         ...prev,
@@ -116,7 +132,6 @@ export default function VoxStationPage() {
       ]);
 
       try {
-        // Stream chat response
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -128,13 +143,14 @@ export default function VoxStationPage() {
         const reader = res.body!.getReader();
         const decoder = new TextDecoder();
         let fullResponse = "";
+        let sentenceBuffer = ""; // accumulates tokens until a sentence is complete
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
-          const text = decoder.decode(value, { stream: true });
-          const lines = text.split("\n").filter(Boolean);
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split("\n").filter(Boolean);
 
           for (const line of lines) {
             if (line.startsWith("data: ")) {
@@ -151,48 +167,36 @@ export default function VoxStationPage() {
                         : m
                     )
                   );
+
+                  // Streaming TTS: speak each sentence as it completes
+                  if (tts) {
+                    sentenceBuffer += parsed.content;
+                    const { complete, remainder } = extractCompleteSentences(sentenceBuffer);
+                    complete.forEach((sentence) => tts.speak(sentence));
+                    sentenceBuffer = remainder;
+                  }
                 }
               } catch {}
             }
           }
         }
 
-        // TTS: Synthesize response with cloned voice
-        if (voiceEnabled && fullResponse.trim() && voiceId) {
-          try {
-            const ttsRes = await fetch("/api/voice/synthesize", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                text: fullResponse,
-                voice_id: voiceId,
-              }),
-            });
-
-            if (ttsRes.ok) {
-              const audioBlob = await ttsRes.blob();
-              const audioUrl = URL.createObjectURL(audioBlob);
-
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId ? { ...m, audioUrl } : m
-                )
-              );
-
-              // Auto-play
-              const audio = new Audio(audioUrl);
-              audio.play().catch(() => {});
-            }
-          } catch (ttsError) {
-            console.warn("TTS failed:", ttsError);
-          }
+        // Speak any remaining text that didn't end with punctuation
+        if (tts && sentenceBuffer.trim().length > 4) {
+          tts.speak(sentenceBuffer.trim());
         }
+
       } catch (error) {
         console.error("Chat error:", error);
+        tts?.stop();
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
-              ? { ...m, content: "Sorry, something went wrong. Check that the Framestation services are running." }
+              ? {
+                  ...m,
+                  content:
+                    "Sorry, something went wrong. Check that the Framestation services are running.",
+                }
               : m
           )
         );
@@ -210,7 +214,6 @@ export default function VoxStationPage() {
     async (audioBlob: Blob) => {
       setIsStreaming(true);
       try {
-        // Transcribe
         const formData = new FormData();
         formData.append("audio", audioBlob, "recording.webm");
 
@@ -227,7 +230,6 @@ export default function VoxStationPage() {
           return;
         }
 
-        // Send as chat message
         setIsStreaming(false);
         await sendMessage(text);
       } catch (error) {
@@ -323,6 +325,16 @@ export default function VoxStationPage() {
               Clone Voice
             </Link>
           )}
+
+          {/* Standalone TTS link */}
+          <Link
+            href="/tts.html"
+            target="_blank"
+            className="text-xs px-3 py-1.5 rounded-lg bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--foreground)] transition-colors"
+            title="Open standalone TTS page"
+          >
+            TTS
+          </Link>
 
           {/* RAG toggle */}
           <button

@@ -25,8 +25,14 @@ class Settings(BaseSettings):
     sample_rate: int = 22050
     max_audio_duration: int = 300  # 5 minutes max recording
 
-    # CORS
-    cors_origins: list[str] = ["http://localhost:3050", "http://192.168.4.165:3050"]
+    # CORS — allow all VoxStation clients on the LAN.
+    # Add your Mac's IP here if accessing from a different machine.
+    cors_origins: list[str] = [
+        "http://localhost:3050",
+        "http://127.0.0.1:3050",
+        "http://192.168.4.165:3050",
+        "http://192.168.4.176:3050",  # Framestation
+    ]
 
     @property
     def effective_compute_type(self) -> str:
