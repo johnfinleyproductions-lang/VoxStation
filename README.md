@@ -55,12 +55,14 @@ If you see a `python` PID holding 20+ GiB that isn't VoxStation: `sudo kill -9 <
 | Whisper large-v2 (CUDA) | ~3.0 GiB | Always loaded |
 | Chatterbox TTS (CUDA) | ~4.8 GiB | Always loaded |
 | **Voice service total** | **~7.8 GiB** | |
-| llama3.2:3b | ~2.0 GiB | ✅ Recommended |
+| llama3.2:3b (ctx=8192) | ~2.5 GiB | ✅ Recommended — 8K context capped in vox script |
 | llama3.1:8b | ~5.5 GiB | Good quality ceiling |
 | nemotron-3-nano:30b | ~24.0 GiB | ❌ Never fits alongside voice service |
 | nomic-embed-text | ~0.3 GiB | Required for RAG |
 
 **Rule:** Model VRAM + 8 GiB (voice) must stay under 31 GiB.
+
+> ⚠️ **Context window matters:** Without `OLLAMA_CONTEXT_LENGTH` set, Ollama allocates the model's maximum context. For llama3.2:3b that's 262K tokens = 22.1 GiB just for the KV cache. The `vox` script caps this at 8192 tokens (~2.5 GiB total). Never start Ollama manually without this env var set.
 
 ---
 
@@ -80,7 +82,7 @@ echo "OLLAMA_MODEL=llama3.2:3b" > ~/VoxStation/.env.local
 ## The `vox` Script
 
 ```bash
-vox start     # Lock GPU clocks, start all services
+vox start     # Lock GPU clocks, start all services (Ollama context capped at 8192)
 vox stop      # Stop everything
 vox logs voice  # Tail voice service logs
 vox status    # Service health + GPU status
@@ -139,6 +141,24 @@ Available at `http://192.168.4.176:3050/tts.html` — bookmark it.
 - `⌘ Enter` or `Ctrl+Enter` to speak, `Esc` to stop
 - Works from any browser on your LAN, no login required
 - Source: `public/tts.html` (static file served by Next.js)
+
+---
+
+## 🔧 Pending Work (Next Sessions)
+
+### Voice Cloning — Better Quality
+The current john voice clone uses 4 short samples. Quality is functional but not great — occasional artifacts, inconsistent cadence. Work needed:
+- Record longer, cleaner voice samples (5-10 min of clean speech, varied pacing)
+- Explore fine-tuning options for Chatterbox voice embedding
+- Test different sample selection strategies (emotional range, sentence variety)
+- Consider whether a dedicated TTS model trained on your voice (e.g., StyleTTS2 fine-tune) would produce better results than Chatterbox's zero-shot cloning
+
+### TTS Reads Full Responses (Not Just the Start)
+Streaming TTS currently queues sentences as they arrive from the LLM. In practice some long responses get cut off — the TTS queue is not draining the full buffer after the LLM finishes. Needs:
+- Debug the `sentenceBuffer` flush logic at end of SSE stream in `app/page.tsx`
+- Confirm the trailing sentence (after last punctuation mark) is always spoken
+- Add a stop/skip button so you can interrupt mid-playback
+- Test with long responses (5+ sentences) end-to-end
 
 ---
 
@@ -221,11 +241,22 @@ Then `sudo systemctl restart docker`.
 
 ## Common Problems
 
-### Chat says “Sorry, something went wrong”
+### Chat says "Sorry, something went wrong"
 1. `nvidia-smi pmon -c 1 -s m` — is something external holding VRAM?
 2. `grep maxDuration ~/VoxStation/app/api/chat/route.ts` — should show 120
 3. `cat ~/VoxStation/.env.local` — should have `OLLAMA_MODEL=llama3.2:3b`
 4. `ollama run tinyllama "hi"` — does Ollama work at all?
+5. Check if Ollama was started without context cap — see below.
+
+### Ollama exit status 2 (even with free VRAM)
+**Cause:** Ollama started without `OLLAMA_CONTEXT_LENGTH` set. It sees 32 GiB free and allocates a 262K token context window — 22.1 GiB for llama3.2:3b alone. With the voice service running (7.8 GiB), this fails intermittently.
+
+**Fix:** Always start Ollama through `vox start`. The vox script sets `OLLAMA_CONTEXT_LENGTH=8192` which caps total usage at ~2.5 GiB.
+
+If Ollama was started manually, kill it and restart via vox:
+```bash
+pkill ollama && sleep 2 && vox start
+```
 
 ### No audio plays in browser
 Check DevTools console for `NotAllowedError`. The `StreamingTTS` class handles this correctly — if it appears, the AudioContext is being created after an async gap rather than synchronously in the click handler.
@@ -341,6 +372,16 @@ Files: `lib/voice/streaming-tts.ts`, updated `app/page.tsx`.
 Available at `/tts.html`. Sentence-by-sentence streaming, voice selector, progress bar, keyboard shortcut.
 Source: `public/tts.html`.
 
+#### ✅ Ollama exit status 2 — context window OOM
+**Symptom:** `llama runner process has terminated: exit status 2` even with 24 GiB VRAM free.
+**Root cause:** `vox start` was launching `ollama serve` without `OLLAMA_CONTEXT_LENGTH`. Ollama sees 32 GiB free and auto-allocates a 262,144-token context for llama3.2:3b — that's 14 GiB KV cache + weights = **22.1 GiB total**. With the voice service at 7.8 GiB, combined usage hit ~30 GiB and failed intermittently depending on memory fragmentation.
+**Diagnosis:** `OLLAMA_DEBUG=1 ollama serve` then `ollama run llama3.2:3b` — log showed `runner.size="22.1 GiB" runner.num_ctx=262144`.
+Fix: Added `OLLAMA_CONTEXT_LENGTH=8192` to `ollama serve` in vox script. llama3.2:3b now uses ~2.5 GiB total. Variable is documented in the vox script as `OLLAMA_CTX=8192`.
+
+#### ✅ Hardcoded fallback model nemotron-3-nano:30b
+**Root cause:** `app/api/chat/route.ts` line: `const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "nemotron-3-nano:30b"`. If `.env.local` ever goes missing, every request tries to load the 24 GiB model = instant OOM.
+Fix: Changed fallback to `"llama3.2:3b"` in source. Now safe even without `.env.local`.
+
 ---
 
 ## API Reference
@@ -367,7 +408,7 @@ Direct voice service (port 8020):
 | Layer | Technology | Notes |
 |---|---|---|
 | Frontend | Next.js 15.5 + React 19 | Tailwind 4.0 |
-| LLM | Ollama — llama3.2:3b | ~2 GiB VRAM |
+| LLM | Ollama — llama3.2:3b | ~2.5 GiB VRAM (8K ctx) |
 | STT | faster-whisper (CTranslate2) | sm_120 native |
 | TTS | Chatterbox (Resemble AI) | sm_120 via nightly PyTorch |
 | PyTorch | Nightly cu128 | 2.12.0.dev20260408+ |
