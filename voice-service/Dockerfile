@@ -10,19 +10,23 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir packaging
 
-# Step 1: Install PyTorch nightly cu128 FIRST.
-# This build includes Blackwell sm_120 compiled kernels (PyTorch 2.7+).
-# It must be installed before requirements.txt so it is not overwritten.
+# Step 1: Install PyTorch nightly cu128 — includes Blackwell sm_120 kernels.
 RUN pip3 install --no-cache-dir torch torchaudio \
     --index-url https://download.pytorch.org/whl/nightly/cu128
 
-# Step 2: Install all other requirements, explicitly skipping torch/torchaudio.
-# Without this filter, pip downloads the ~530MB stable torch wheel from PyPI
-# and overwrites the nightly build above. Filtering prevents that download
-# entirely — pip sees nightly torch is already installed and skips it for
-# any transitive dependency (e.g. chatterbox-tts) that requires torch.
+# Step 2: Pin the installed nightly version in a constraints file.
+# Without this, chatterbox-tts and resemble-perth resolve torch as a
+# transitive dependency and pip downgrades to stable cu124 from PyPI,
+# removing Blackwell sm_120 kernels. The constraints file prevents pip
+# from changing torch to any other version in subsequent install steps.
+RUN pip3 show torch | grep '^Version:' | sed 's/Version: /torch==/' > /tmp/torch_pin.txt && \
+    pip3 show torchaudio | grep '^Version:' | sed 's/Version: /torchaudio==/' >> /tmp/torch_pin.txt && \
+    echo "Pinned torch constraint:" && cat /tmp/torch_pin.txt
+
+# Step 3: Install all other requirements with the nightly pin enforced.
+# pip will see torch is already installed at the pinned version and skip it.
 RUN grep -vE '^torch|^torchaudio' requirements.txt > /tmp/reqs_notorch.txt && \
-    pip3 install --no-cache-dir -r /tmp/reqs_notorch.txt
+    pip3 install --no-cache-dir -c /tmp/torch_pin.txt -r /tmp/reqs_notorch.txt
 
 # App code
 COPY . .
