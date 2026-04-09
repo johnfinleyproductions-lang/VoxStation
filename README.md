@@ -8,42 +8,27 @@ Voice-enabled AI chat system running entirely on local hardware. Speak to your A
 
 ## Architecture
 
-VoxStation runs across three services on a single machine (Framestation 395):
-
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Browser (Mac)                                              │
-│  http://192.168.4.176:3050                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
-│  │ Chat UI  │  │ Voice    │  │ Clone    │                  │
-│  │ SSE      │  │ Controls │  │ /clone   │                  │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘                  │
-└───────┼──────────────┼─────────────┼────────────────────┘
-        │              │             │
-        ▼              ▼             ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Next.js Frontend (port 3050)                               │
-│  /api/chat          → Ollama + RAG → SSE stream             │
-│  /api/voice/transcribe → Voice Service /transcribe          │
-│  /api/voice/synthesize → Voice Service /synthesize          │
-│  /api/voice/clone      → Voice Service /voices/clone        │
-│  /api/voice/voices     → Voice Service /voices              │
-│  /api/voice/pipeline   → Full voice pipeline                │
-└────────┬───────────────────────┬────────────────────────────┘
-         │                       │
-         ▼                       ▼
-┌──────────────────┐   ┌──────────────────────────────────────┐
-│  Ollama (11434)  │   │  Voice Service Docker (8020)         │
-│  nemotron-3-nano │   │  ├─ Whisper STT → CUDA ✅            │
-│  :30b on GPU     │   │  └─ Chatterbox TTS → CUDA ✅         │
-│                  │   │     (PyTorch nightly cu128, sm_120)   │
-└──────────────────┘   └──────────────────────────────────────┘
+│  Browser (Mac)  http://192.168.4.176:3050                   │
+└───────┬──────────────────┬──────────────────┬───────────────┘
+        ▼                  ▼                  ▼
+┌────────────────────────────────────────────────────────────┐
+│  Next.js Frontend (port 3050)                              │
+│  /api/chat → Ollama + RAG → SSE stream                     │
+│  /api/voice/* → Voice Service proxy                        │
+└────────┬──────────────────────────┬────────────────────────┘
+         ▼                          ▼
+┌──────────────────┐   ┌────────────────────────────────────┐
+│  Ollama (11434)  │   │  Voice Service Docker (8020)       │
+│  llama3.2:3b     │   │  ├─ Whisper STT → CUDA ✅          │
+│  (or larger)     │   │  └─ Chatterbox TTS → CUDA ✅       │
+└──────────────────┘   └────────────────────────────────────┘
          │
          ▼
 ┌──────────────────┐
 │  Qdrant (6333)   │
 │  evergreen_kb    │
-│  collection      │
 └──────────────────┘
 ```
 
@@ -60,7 +45,47 @@ VoxStation runs across three services on a single machine (Framestation 395):
 | **Host** | Framestation 395 (IP: `192.168.4.176`) |
 | **Client** | Mac Mini M4 (daily driver / browser) |
 
-**OCuLink vs USB4:** The RTX PRO 4500 is connected via an OCuLink eGPU dock. OCuLink provides the full PCIe bandwidth needed to sustain GPU boost clocks. On USB4/Thunderbolt the GPU is bottlenecked to ~700 MHz — OCuLink removes that ceiling entirely.
+---
+
+## VRAM Budget — Read This First
+
+The RTX PRO 4500 has 31.37 GiB of VRAM. Every service that uses the GPU competes for this pool. Exceeding it causes CUDA OOM errors that silently kill voice synthesis and transcription.
+
+| Service | VRAM Used | Notes |
+|---|---|---|
+| Whisper large-v2 (CUDA) | ~3.0 GiB | CTranslate2 |
+| Chatterbox TTS (CUDA) | ~4.8 GiB | PyTorch nightly |
+| **Voice service total** | **~7.8 GiB** | Both loaded at startup |
+| llama3.2:3b | ~2.0 GiB | Recommended LLM |
+| llama3.2:8b | ~5.5 GiB | Good quality ceiling |
+| nemotron-3-nano:30b | ~24.0 GiB | ⚠️ Fills nearly entire GPU |
+| nomic-embed-text | ~0.3 GiB | Required for RAG |
+| **Safe headroom target** | **~2 GiB free** | Prevents OOM on large inputs |
+
+**Maximum safe LLM with full voice service active: ~19 GiB** (31.37 - 7.8 - 2 headroom - 0.3 embeddings).
+
+### Why CUDA OOM happens silently
+
+When Ollama loads a model, it stays in VRAM for `KEEP_ALIVE` minutes (default: 5) even after the request finishes. If you tried a large model that failed, it may still occupy VRAM. Symptoms: voice synthesis and transcription both return 500, GPU shows near-zero free VRAM, chat still works.
+
+**Diagnose:**
+```bash
+nvidia-smi --query-gpu=memory.free,memory.used --format=csv
+# Check what Ollama has loaded
+curl http://127.0.0.1:11434/api/ps
+```
+
+**Fix — evict a specific model:**
+```bash
+curl -X POST http://127.0.0.1:11434/api/generate \
+  -d '{"model":"nemotron-3-nano:30b","keep_alive":0,"prompt":""}'
+```
+
+**Fix — nuclear option:**
+```bash
+vox stop && vox start
+# Ollama starts fresh with nothing in VRAM
+```
 
 ---
 
@@ -77,172 +102,44 @@ VoxStation runs across three services on a single machine (Framestation 395):
 
 ## The `vox` Script
 
-VoxStation is managed by a single shell script (`vox`) that handles starting, stopping, and managing all services. It is the **only way** you should start VoxStation.
-
 ```bash
-vox start     # Start all services (locks GPU clocks first)
-vox stop      # Stop all containers
+vox start     # Lock GPU clocks, start all services
+vox stop      # Stop everything
 vox restart   # Stop + start
-vox logs      # Tail voice service logs
-vox logs voice  # Tail just the voice service
-vox status    # Show container and GPU status
+vox logs voice  # Tail voice service logs
+vox status    # Show service health + GPU clock status
 ```
 
-### ⚠️ CRITICAL: The System vox vs the Git vox
+### ⚠️ CRITICAL: Two Copies of vox
 
-There are **two copies** of the vox script:
-- `~/VoxStation/vox` — the git-tracked source copy
-- `/usr/local/bin/vox` — the **system copy** that actually runs when you type `vox`
+- `~/VoxStation/vox` — git source
+- `/usr/local/bin/vox` — **the one that actually runs**
 
-After any `git pull` that changes the vox script, you **must** manually sync the system copy:
-
+After any `git pull` that changes `vox`:
 ```bash
 sudo cp ~/VoxStation/vox /usr/local/bin/vox
 ```
 
-Forgetting this is a common source of confusion — the system will silently run the old version.
-
-### GPU Clock Locking
-
-`vox start` locks the GPU clocks to 1933 MHz before launching any containers. This ensures stable inference throughput over OCuLink:
-
-```bash
-sudo nvidia-smi -lgc 1933,1933
-sudo nvidia-smi -pl 186
-```
+Forgetting this means `vox` silently runs old code. This has caused multiple debugging sessions.
 
 ---
 
-## GPU Setup (NVIDIA Container Toolkit)
-
-To enable GPU passthrough into Docker containers, the NVIDIA Container Toolkit must be installed and configured.
-
-### Install
+## Prerequisites — Pull These Before First Run
 
 ```bash
-sudo pacman -S nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
+# LLM (required)
+ollama pull llama3.2:3b
 
-### Fix for CachyOS / Arch Linux (`no-cgroups` bug)
+# Embeddings for RAG (required — without this, every chat logs "Embedding generation failed")
+ollama pull nomic-embed-text
 
-On CachyOS, the default `config.toml` has `no-cgroups = true`, which causes `--gpus all` to be silently ignored — Docker starts the container without any GPU access and no error is shown.
-
-Edit `/etc/nvidia-container-runtime/config.toml`:
-```toml
-no-cgroups = false
-```
-
-Then restart Docker:
-```bash
-sudo systemctl restart docker
-```
-
-### Verify GPU passthrough works
-
-```bash
-docker run --rm --gpus all nvidia/cuda:12.8.0-runtime-ubuntu22.04 nvidia-smi
-```
-
-This should show the RTX PRO 4500 with CUDA 13.2. If it shows nothing or errors, the toolkit is not configured correctly.
-
-### Diagnose missing GPU inside a running container
-
-```bash
-docker inspect voxstation_voice | grep -A 20 DeviceRequests
-```
-
-If `DeviceRequests` is `null`, the container was started without GPU — either the system `/usr/local/bin/vox` is stale, or the toolkit config is wrong.
-
----
-
-## Project Structure
-
-```
-VoxStation/
-├── app/
-│   ├── page.tsx                    # Main chat + voice UI
-│   ├── clone/page.tsx              # Voice cloning UI
-│   ├── layout.tsx                  # Root layout
-│   ├── globals.css                 # Tailwind + CSS variables
-│   └── api/
-│       ├── chat/route.ts           # Chat endpoint — streams Ollama via SSE
-│       └── voice/
-│           ├── transcribe/route.ts # Proxy to voice service STT
-│           ├── synthesize/route.ts # Proxy to voice service TTS
-│           ├── clone/route.ts      # Proxy to voice service clone
-│           ├── voices/route.ts     # List available voice profiles
-│           └── pipeline/route.ts   # Full speak→transcribe→LLM→TTS pipeline
-├── lib/
-│   ├── chat/
-│   │   ├── ollama-client.ts        # Streaming Ollama client
-│   │   └── rag-client.ts           # Qdrant vector search + context builder
-│   ├── voice/
-│   │   ├── recorder.ts             # Browser MediaRecorder wrapper
-│   │   └── voice-client.ts         # Voice service API client
-│   └── utils.ts                    # clsx + tailwind-merge helper
-├── components/
-│   ├── chat/
-│   │   ├── chat-panel.tsx          # Scrolling message list
-│   │   └── message-bubble.tsx      # Individual message + audio playback
-│   ├── voice/
-│   │   └── voice-controls.tsx      # Mic button + text input
-│   └── layout/
-│       └── status-bar.tsx          # Service health indicators
-├── voice-service/                  # Python FastAPI service (Docker)
-│   ├── main.py                     # FastAPI app + lifespan (model loading)
-│   ├── config.py                   # Pydantic settings (env-driven)
-│   ├── Dockerfile                  # CUDA base + nightly PyTorch + --no-deps chatterbox
-│   ├── docker-compose.yml          # Compose config (see notes on ghost containers)
-│   ├── requirements.txt            # Python deps
-│   ├── routers/
-│   │   ├── health.py               # GET /health
-│   │   ├── transcribe.py           # POST /transcribe
-│   │   ├── synthesize.py           # POST /synthesize
-│   │   └── voices.py               # GET /voices, POST /voices/clone
-│   └── services/
-│       ├── whisper_service.py      # faster-whisper STT
-│       ├── tts_service.py          # Chatterbox TTS + voice cloning
-│       └── gpu_monitor.py          # GPU utilization tracker
-├── vox                             # VoxStation management script (git source)
-├── .env                            # Runtime config (not committed)
-├── .env.example                    # Template
-├── package.json                    # Next.js 15 + React 19
-├── next.config.ts                  # Minimal config
-└── ARCHITECTURE.md                 # Original design doc
-```
-
----
-
-## Environment Variables
-
-Create a `.env` in the project root:
-
-```bash
-# IMPORTANT: Use 127.0.0.1, NOT localhost
-# Node.js resolves localhost to ::1 (IPv6) but Ollama only listens on IPv4
-
-VOICE_SERVICE_URL=http://127.0.0.1:8020
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_MODEL=nemotron-3-nano:30b
-QDRANT_URL=http://127.0.0.1:6333
-QDRANT_COLLECTION=evergreen_kb
-EMBEDDING_MODEL=nomic-embed-text
-PORT=3050
+# Verify both are present
+ollama list
 ```
 
 ---
 
 ## Quick Start
-
-### Prerequisites
-
-On the Framestation:
-- Ollama installed with `nemotron-3-nano:30b` pulled
-- Qdrant running on port 6333 with `evergreen_kb` collection
-- Docker installed with NVIDIA Container Toolkit (see GPU Setup above)
-- Node.js 18+ and npm
 
 ### 1. Build the voice service image
 
@@ -251,166 +148,213 @@ cd ~/VoxStation/voice-service
 docker build -t voxstation-voice .
 ```
 
-First build takes ~10-15 minutes (downloads PyTorch nightly and all model deps).
+First build ~10-15 minutes. Subsequent builds use cache (~2 minutes unless Dockerfile changes).
 
-### 2. Start everything with vox
+### 2. Start everything
 
 ```bash
 vox start
+vox logs voice   # Watch until you see "Application startup complete"
 ```
 
-Wait for the voice service to finish loading models (~60-90s). Check logs:
-
-```bash
-vox logs voice
-```
-
-**Expected good output:**
+**Expected startup output (voice service):**
 ```
 Loading Whisper large-v2 on cuda (float16)...
 Whisper large-v2 loaded on cuda (float16)
 Loading Chatterbox TTS on cuda...
 Chatterbox TTS loaded on cuda
+VoxStation Voice Service ready on port 8020
 Application startup complete.
 ```
 
-### 3. Start the Frontend
+### 3. Build and start the frontend
 
 ```bash
 cd ~/VoxStation
-npm install
 npm run build
 npm start
+# OR just: vox start (it handles this too)
 ```
 
-### 4. Open in Browser
+### 4. Open in browser
 
-Navigate to `http://192.168.4.176:3050` from your Mac.
+`http://192.168.4.176:3050`
 
-To use the microphone over HTTP (not HTTPS), add the Framestation IP to Chrome's insecure origins:
+For microphone access over HTTP, add the IP to Chrome's insecure origins:
+`chrome://flags/#unsafely-treat-insecure-origin-as-secure`
 
-1. Go to `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
-2. Add `http://192.168.4.176:3050`
-3. Relaunch Chrome
+### 5. Clone your voice
 
-### 5. Clone Your Voice
-
-1. Click "Clone Voice" in the header (or go to `/clone`)
-2. Record a 10-30 second sample of your voice
-3. Enter a voice name (e.g., "john")
-4. Click "Clone My Voice"
-
-Voice samples are saved to `voice-service/voices/<name>/` as WAV files.
+Go to `/clone`, record 10-30s of clear speech, name it, click Clone.
 
 ---
 
-## How to Rebuild After Changes
+## Full Rebuild After Code Changes
 
 ```bash
 cd ~/VoxStation && git pull
-sudo cp ~/VoxStation/vox /usr/local/bin/vox   # ALWAYS after vox script changes
+sudo cp ~/VoxStation/vox /usr/local/bin/vox   # if vox changed
+
 vox stop
 docker rm voxstation_voice
-docker rmi voxstation-voice                    # Omit if only the vox script changed
+docker rmi voxstation-voice   # skip if only Python files changed, not Dockerfile
 docker build -t voxstation-voice voice-service/
+npm run build                 # if any Next.js files changed
 vox start
 vox logs voice
 ```
 
 ---
 
-## Blackwell GPU Status (sm_120) — FULLY SOLVED ✅
-
-All VoxStation components run on CUDA on the RTX PRO 4500 Blackwell.
-
-| Component | Status | Notes |
-|---|---|---|
-| Docker GPU passthrough (`--gpus all`) | ✅ | NVIDIA Container Toolkit + `no-cgroups = false` |
-| GPU clocks locked at 1933 MHz via OCuLink | ✅ | `nvidia-smi -lgc 1933,1933` in vox script |
-| Ollama LLM on GPU | ✅ | llama.cpp — has its own CUDA kernel path |
-| Whisper large-v2 on CUDA (float16) | ✅ | CTranslate2 supports sm_120 natively |
-| **Chatterbox TTS on CUDA** | ✅ **SOLVED** | PyTorch nightly 2.12.0.dev20260408+cu128 |
-
-**Solved on:** April 9, 2026  
-**PyTorch version confirmed working:** `2.12.0.dev20260408+cu128`  
-**Arch list confirmed:** `['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']`
-
-### How it was solved
-
-`chatterbox-tts` versions 0.1.0–0.1.7 all hard-pin `torchaudio==2.6.0`, which forces pip to install `torch==2.6.0+cu124` — a stable build with no sm_120 kernels. The fix is a two-part approach in the Dockerfile:
-
-**1. Install chatterbox with `--no-deps`** to bypass the torchaudio pin:
-```dockerfile
-RUN pip3 install --no-cache-dir --no-deps chatterbox-tts
-```
-
-**2. Install PyTorch nightly cu128 first**, before anything else can overwrite it:
-```dockerfile
-RUN pip3 install --no-cache-dir torch torchaudio \
-    --index-url https://download.pytorch.org/whl/nightly/cu128
-```
-
-PyTorch nightly `2.12.0.dev20260408+cu128` is the first build to include compiled sm_120 kernels.
-
-### Full Dockerfile
-
-```dockerfile
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
-WORKDIR /app
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-venv ffmpeg libsndfile1 git \
-    && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt .
-RUN pip3 install --no-cache-dir packaging
-# Install nightly PyTorch FIRST — must happen before any other package touches torch
-RUN pip3 install --no-cache-dir torch torchaudio \
-    --index-url https://download.pytorch.org/whl/nightly/cu128
-# Install everything except torch/torchaudio/chatterbox
-RUN grep -vE '^torch|^torchaudio|^chatterbox' requirements.txt > /tmp/reqs_base.txt && \
-    pip3 install --no-cache-dir -r /tmp/reqs_base.txt
-# Install chatterbox WITHOUT deps to bypass the torchaudio==2.6.0 hard pin
-RUN pip3 install --no-cache-dir --no-deps chatterbox-tts
-# Manually supply chatterbox's actual runtime dependencies
-RUN pip3 install --no-cache-dir \
-    "resemble-perth>=1.0.0" "pykakasi==2.3.0" "diffusers==0.29.0" \
-    omegaconf "librosa==0.11.0" s3tokenizer spacy-pkuseg \
-    "transformers==5.2.0" "safetensors==0.5.3" "conformer==0.3.2" pyloudnorm
-COPY . .
-RUN mkdir -p models voices
-EXPOSE 8020
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8020"]
-```
-
-### Verify torch version in the container
+## GPU Setup (NVIDIA Container Toolkit)
 
 ```bash
-docker run --rm --gpus all voxstation-voice python3 -c \
-  "import torch; print(torch.__version__); print(torch.cuda.get_arch_list())"
-# Expected:
-# 2.12.0.dev20260408+cu128
-# ['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']
+sudo pacman -S nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
 ```
 
-### Future: Switch to PyTorch 2.7 stable when it ships
+### CachyOS `no-cgroups` Bug
 
-When PyTorch 2.7 stable includes sm_120, the Dockerfile can be simplified back to a standard install:
-```dockerfile
-RUN pip3 install torch torchaudio  # remove --index-url nightly line
+The default `/etc/nvidia-container-runtime/config.toml` has `no-cgroups = true` on CachyOS, which silently strips GPU access from containers. `docker inspect` shows `DeviceRequests: null`.
+
+**Fix:**
+```toml
+# /etc/nvidia-container-runtime/config.toml
+no-cgroups = false
+```
+Then `sudo systemctl restart docker`.
+
+### Verify GPU passthrough
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.8.0-runtime-ubuntu22.04 nvidia-smi
+docker inspect voxstation_voice | grep -A 5 DeviceRequests
 ```
 
 ---
 
-## Chatterbox TTS on Blackwell — Full History
+## Blackwell (sm_120) GPU — Status FULLY SOLVED ✅
 
-Complete record of everything tried, for reference.
+| Component | Status |
+|---|---|
+| Docker GPU passthrough | ✅ NVIDIA Container Toolkit + no-cgroups fix |
+| GPU clocks 1933 MHz via OCuLink | ✅ nvidia-smi lock in vox script |
+| Ollama LLM | ✅ llama.cpp has its own CUDA path |
+| Whisper STT (CTranslate2) | ✅ CTranslate2 natively supports sm_120 |
+| Chatterbox TTS (PyTorch) | ✅ Solved April 9 2026 — nightly 2.12.0.dev20260408+cu128 |
 
-### What was tried and why it failed
+**PyTorch arch list confirmed:** `['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']`
 
-**Approach 1 — cu130 nightly:** Same sm_120 error. cu130 nightly as of early April 2026 also only compiled up to sm_90.
+**How TTS was solved:** `chatterbox-tts` 0.1.0–0.1.7 hard-pins `torchaudio==2.6.0`, forcing `torch==2.6.0+cu124` (no sm_120). Fix: install chatterbox with `--no-deps` to bypass the pin, install PyTorch nightly cu128 first. Full Dockerfile in `voice-service/Dockerfile`.
 
-**Approach 2 — pip constraints file:** Failed with `ResolutionImpossible`. chatterbox-tts hard-pins `torchaudio==2.6.0` as an exact version pin across all releases 0.1.0–0.1.7. pip cannot satisfy both `torchaudio==2.6.0` (chatterbox) and `torchaudio==2.11.0.dev...+cu128` (nightly) simultaneously. Additionally, `requirements.txt` contains `torch>=2.5.0`, which causes pip to silently downgrade nightly torch to `2.6.0+cu124` from PyPI if chatterbox is installed afterward. The tell-tale sign of this downgrade: `torch.cuda.get_arch_list()` returns `[]`.
+---
 
-**Approach 3 — `--no-deps` + manual deps + nightly cu128:** ✅ **This worked.** PyTorch nightly `2.12.0.dev20260408+cu128` (April 8, 2026) was the first build to ship sm_120 kernels. The `--no-deps` flag bypasses chatterbox's torchaudio pin entirely.
+## Debugging Log
+
+Chronological record of what worked, what broke, and why. Use this to avoid re-investigating solved problems.
+
+---
+
+### Session 1 — April 2026
+
+**Goal:** Get GPU inference working for all VoxStation components on RTX PRO 4500 Blackwell.
+
+#### ✅ SOLVED: Docker GPU passthrough
+
+**Symptom:** `docker inspect voxstation_voice` showed `DeviceRequests: null`. GPU completely invisible inside container despite `--gpus all` in the run command.
+
+**Root cause 1:** `/usr/local/bin/vox` was an old installed copy of the script that predated the `--gpus all` flag. Running `vox` was running old code silently.
+**Fix:** `sudo cp ~/VoxStation/vox /usr/local/bin/vox`
+
+**Root cause 2:** `/etc/nvidia-container-runtime/config.toml` had `no-cgroups = true` (CachyOS default). This silently disables GPU passthrough.
+**Fix:** Set `no-cgroups = false`, restart Docker.
+
+---
+
+#### ✅ SOLVED: Whisper STT on CUDA
+
+Whisper large-v2 via CTranslate2 works on sm_120 natively. No modifications needed. Loads on `cuda (float16)` cleanly.
+
+---
+
+#### ✅ SOLVED: Chatterbox TTS on CUDA
+
+**Symptom:** `RuntimeError: CUDA error: no kernel image is available for execution on the device`
+
+**Root cause:** PyTorch stable and early nightly builds did not include sm_120 kernels. chatterbox-tts pins `torchaudio==2.6.0` exactly, forcing `torch==2.6.0+cu124` which only goes up to sm_90.
+
+**What failed:**
+- cu130 nightly — still no sm_120
+- pip constraints file — `ResolutionImpossible` (chatterbox's exact pin defeats constraints)
+- Standard install order — pip silently downgrades nightly back to stable
+
+**What worked:** `--no-deps` install of chatterbox + nightly cu128 installed first. PyTorch `2.12.0.dev20260408+cu128` (April 8, 2026) was first build with sm_120.
+
+---
+
+#### ✅ SOLVED: TTS saving audio (TorchCodec error)
+
+**Symptom:** TTS generated audio successfully on CUDA (~100 it/s visible in logs) but crashed on save with: `TorchCodec is required for save_with_torchcodec`.
+
+**Root cause:** PyTorch nightly 2.12.0 changed `torchaudio.save()` default backend to TorchCodec, which is not installed.
+
+**Fix:** Replaced `torchaudio.save()` with `soundfile.write()` in `tts_service.py`. soundfile is already installed.
+
+---
+
+#### ✅ SOLVED: Next.js voice API returning 500
+
+**Symptom:** Direct curl to port 8020 worked. All `/api/voice/*` routes at port 3050 returned 500.
+
+**Root cause 1:** `voice-client.ts` had wrong fallback URL `http://192.168.4.240:8020` (wrong IP). If `VOICE_SERVICE_URL` env var wasn't loaded, all voice calls hit a nonexistent machine.
+**Fix:** Changed fallback to `http://127.0.0.1:8020`.
+
+**Root cause 2:** Next.js API routes default to 10s timeout in production. TTS takes 8-40s depending on warm/cold state. Routes were timing out silently.
+**Fix:** Added `export const maxDuration = 60` to `/api/voice/synthesize/route.ts` and `/api/voice/clone/route.ts`.
+
+**Root cause 3:** Very long LLM responses sent to TTS caused slow synthesis and degraded audio quality.
+**Fix:** Added 500-character truncation at sentence boundary in synthesize route.
+
+---
+
+#### ✅ SOLVED: Ollama model not loading
+
+**Symptom:** `{"error":"llama runner process has terminated: exit status 2"}`
+
+**Root cause 1:** `nemotron-3-nano:30b` download was corrupted. The runner crashed on both GPU and CPU mode.
+**Diagnostic:** `ollama pull tinyllama && ollama run tinyllama "hi"` — tinyllama worked, proving the runner itself was fine.
+**Fix:** `ollama rm nemotron-mini && ollama pull nemotron-mini` (re-download). Alternatively switch to `llama3.2:3b` which has no known corruption issues.
+
+**Root cause 2:** `nomic-embed-text` was never pulled. Every chat request logged `Embedding generation failed` and continued without RAG context.
+**Fix:** `ollama pull nomic-embed-text`
+
+---
+
+#### ⚠️ KNOWN ISSUE: CUDA OOM when large model left in VRAM
+
+**Symptom:** Voice synthesis and transcription both return 500. Frontend log shows `CUDA out of memory`. GPU has <100 MiB free despite voice service only needing ~7.8 GiB.
+
+**Root cause:** A previously attempted large model (e.g. `nemotron-3-nano:30b` at 24 GiB) occupies VRAM even after its runner crashes. Ollama's `KEEP_ALIVE=5m` keeps models loaded. The crashed model never releases VRAM.
+
+**Diagnosis:**
+```bash
+nvidia-smi --query-gpu=memory.free,memory.used --format=csv
+curl http://127.0.0.1:11434/api/ps
+```
+
+**Fix — evict without restart:**
+```bash
+curl -X POST http://127.0.0.1:11434/api/generate \
+  -d '{"model":"nemotron-3-nano:30b","keep_alive":0,"prompt":""}'
+```
+
+**Fix — full restart:**
+```bash
+vox stop && vox start
+```
+
+**Prevention:** Stick to models under 19 GiB when voice service is running. `llama3.2:3b` (2 GiB) is the recommended default. `llama3.2:8b` (5.5 GiB) is the quality ceiling with comfortable headroom.
 
 ---
 
@@ -418,173 +362,124 @@ Complete record of everything tried, for reference.
 
 ### Node.js IPv6 Resolution
 
-Node.js `fetch("http://localhost:...")` resolves to `::1` (IPv6), but Ollama and other services only bind to `127.0.0.1` (IPv4). This causes connections to hang silently with no error.
+`fetch("http://localhost:...")` resolves to `::1` (IPv6). Ollama and other services only bind `127.0.0.1`. Connections hang silently.
 
 **Fix:** Always use `127.0.0.1` in `.env`, never `localhost`.
 
-### Browser WebM → WAV Conversion
+### Docker Build Cache Hides Stale Packages
 
-Browsers record audio as WebM/Opus. Chatterbox requires 24kHz mono WAV. The voice service uses ffmpeg to convert:
+`docker rmi` removes the image tag but not the build cache. `pip install` layers serve from cache. You can be running old torch versions without knowing it.
 
-```python
-subprocess.run([
-    "ffmpeg", "-y", "-i", input_path,
-    "-ar", "24000", "-ac", "1", "-f", "wav", output_path
-])
-```
-
-### Docker Compose Ghost Containers
-
-Docker Compose can develop corrupted internal state where it references deleted containers by ID. Symptoms: `docker compose up` fails with "No such container" even after `docker compose down`.
-
-**Workaround:** Use `docker run` directly via the `vox` script.
-
-### Docker Build Cache Surprises
-
-`docker rmi <image>` removes the image tag but does **not** clear the build cache. To force a fresh PyTorch download:
-
+**Fix:** Use `--no-cache` when you need a fresh install:
 ```bash
 docker build --no-cache -t voxstation-voice voice-service/
 ```
 
+**Verify torch in the container:**
+```bash
+docker run --rm --gpus all voxstation-voice python3 -c \
+  "import torch; print(torch.__version__); print(torch.cuda.get_arch_list())"
+```
+
+### Docker Compose Ghost Containers
+
+`docker compose up` can fail with "No such container" after `docker compose down`. Corrupted internal state.
+
+**Fix:** Use `docker run` directly via the vox script.
+
 ### CachyOS Firewall
 
-CachyOS blocks incoming connections by default. Open port 3050 for LAN:
-
+Blocks LAN connections by default:
 ```bash
 sudo iptables -I INPUT -p tcp --dport 3050 -j ACCEPT
 ```
 
-### Next.js Streaming SSE in Production
+### Whisper CPU Compute Type
 
-Next.js production mode can buffer SSE streams. Fix with `TransformStream` plus:
+CPU does not support float16. Set `VOXSTATION_WHISPER_COMPUTE_TYPE=int8` when running Whisper on CPU. The config auto-detects this.
 
-```typescript
-export const dynamic = "force-dynamic";
+### HuggingFace 503 Outages
 
-headers: {
-  "Content-Type": "text/event-stream",
-  "Cache-Control": "no-cache, no-transform",
-  "X-Accel-Buffering": "no",
-}
-```
+Model downloads fail with `LocalEntryNotFoundError` during HF outages. Restart the container once HF recovers. Long-term: pre-cache models and set `HF_HUB_OFFLINE=1`.
 
-### Whisper Compute Type
+### Coil Whine from GPU
 
-CPU does not support float16. When running Whisper on CPU, set:
-
-```bash
--e VOXSTATION_WHISPER_COMPUTE_TYPE=int8
-```
-
-The config auto-detects this when `whisper_compute_type` is left unset.
-
-### HuggingFace 503 Errors
-
-HF Hub has intermittent outages. If model files fail to download at startup, the service crashes with `LocalEntryNotFoundError`. Wait for HF to recover and restart the container. Long-term fix: pre-cache models in a volume and set `HF_HUB_OFFLINE=1`.
-
-### Performance (Full CUDA)
-
-With everything on GPU:
-- **Whisper STT (large-v2, CUDA float16):** ~1-3s for a 30s recording
-- **Chatterbox TTS (CUDA):** ~5-10s model load (first request), ~2-5s per synthesis
-- **Ollama LLM (GPU):** ~1-2s response time
+A faint screeching sound from the GPU under varying load is **normal** — electromagnetic vibration from inductors on the PCB. Not harmful.
 
 ---
 
-## API Endpoints
-
-### Chat
+## API Reference
 
 ```
-POST /api/chat
-Body: { messages: [{role, content}], useRAG?: boolean, model?: string }
-Returns: text/event-stream (SSE)
-  data: {"content": "chunk"}
-  data: [DONE]
+POST /api/chat              → SSE stream of LLM response (with RAG)
+POST /api/voice/transcribe  → Whisper STT → { text, language, duration }
+POST /api/voice/synthesize  → Chatterbox TTS → audio/wav
+POST /api/voice/clone       → Save voice sample → { id, name, total_samples }
+GET  /api/voice/voices      → List voice profiles
+POST /api/voice/pipeline    → Full voice→voice pipeline
 ```
 
-### Voice
-
+Direct voice service (port 8020):
 ```
-POST /api/voice/transcribe
-Body: FormData with "audio" file
-Returns: { text, language, duration }
-
-POST /api/voice/synthesize
-Body: { text, voice_id }
-Returns: audio/wav binary
-
-POST /api/voice/clone
-Body: FormData with "audio" file, "voice_id", optional "name"
-Returns: { id, name, sample_saved, total_samples }
-
-GET /api/voice/voices
-Returns: [{ id, name, sample_count, samples }]
-
-POST /api/voice/pipeline
-Body: FormData with "audio" file, optional "voice_id"
-Returns: { transcription, response, audioUrl }
-```
-
-### Voice Service Direct (port 8020)
-
-```
-GET  /health              → { status, models, voices, gpu }
-POST /transcribe          → { text, language, duration, segments }
-POST /synthesize          → audio/wav binary
-GET  /voices              → [{ id, name, sample_count }]
-POST /voices/clone        → { id, name, sample_saved }
+GET  /health     → { status, models, voices, gpu }
+POST /transcribe → { text, language, duration, segments }
+POST /synthesize → audio/wav
+GET  /voices     → [{ id, name, sample_count }]
+POST /voices/clone → { id, name, sample_saved }
 ```
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology | Version |
+| Layer | Technology | Notes |
 |---|---|---|
-| Frontend | Next.js + React | 15.5 + 19 |
-| Styling | Tailwind CSS | 4.0 |
-| LLM | Ollama (nemotron-3-nano:30b) | Latest |
-| STT | faster-whisper (CTranslate2) | 1.1+ |
-| TTS | Chatterbox (Resemble AI) | 0.1+ |
-| PyTorch | Nightly cu128 (sm_120 support) | 2.12.0.dev20260408+ |
-| RAG | Qdrant + nomic-embed-text | Latest |
-| Voice Service | FastAPI + Uvicorn | 0.115+ |
-| Container | Docker (nvidia/cuda:12.8.0-runtime-ubuntu22.04) | — |
-| OS | CachyOS (Arch Linux) | — |
+| Frontend | Next.js 15.5 + React 19 | Tailwind 4.0 |
+| LLM | Ollama — llama3.2:3b | ~2 GiB VRAM |
+| STT | faster-whisper (CTranslate2) | sm_120 native |
+| TTS | Chatterbox (Resemble AI) | sm_120 via nightly PyTorch |
+| PyTorch | Nightly cu128 | 2.12.0.dev20260408+ |
+| RAG | Qdrant + nomic-embed-text | evergreen_kb collection |
+| Voice Service | FastAPI + Uvicorn | Docker, nvidia/cuda:12.8.0-runtime |
+| OS | CachyOS (Arch Linux) | nvidia-open-dkms |
 
 ---
 
-## Development
+## Development Commands
 
 ```bash
-# Dev mode with hot reload
-npm run dev
+# Full system health check
+vox status
+curl http://127.0.0.1:8020/health
+curl http://127.0.0.1:11434/api/ps          # what's loaded in Ollama VRAM
+nvidia-smi --query-gpu=memory.free,memory.used --format=csv
 
-# Full rebuild of voice service after code changes
-vox stop
-docker rm voxstation_voice
-docker rmi voxstation-voice
-docker build -t voxstation-voice voice-service/
-vox start
+# Test TTS directly (bypasses Next.js)
+curl -X POST http://127.0.0.1:8020/synthesize \
+  -H "Content-Type: application/json" \
+  -d '{"text":"hello","voice_id":"john"}' \
+  --output /tmp/test.wav -w "\nTime: %{time_total}s\n"
+aplay -f cd /tmp/test.wav
+
+# Test TTS through Next.js proxy
+curl -X POST http://127.0.0.1:3050/api/voice/synthesize \
+  -H "Content-Type: application/json" \
+  -d '{"text":"hello","voice_id":"john"}' \
+  --output /tmp/test.wav -w "\nHTTP: %{http_code} | Time: %{time_total}s\n"
+
+# View frontend error log
+tail -50 ~/VoxStation/.vox-frontend.log
+
+# View voice service logs
 vox logs voice
 
-# Quick restart (vox script changes only)
-vox stop
-sudo cp ~/VoxStation/vox /usr/local/bin/vox
-vox start
+# Evict a model from Ollama VRAM
+curl -X POST http://127.0.0.1:11434/api/generate \
+  -d '{"model":"MODEL_NAME","keep_alive":0,"prompt":""}'
 
-# Verify torch/CUDA inside the container
+# Verify torch inside container
 docker run --rm --gpus all voxstation-voice python3 -c \
   "import torch; print(torch.__version__); print(torch.cuda.get_arch_list())"
-
-# Check voice service health
-curl http://127.0.0.1:8020/health
-
-# Test Ollama directly
-curl http://127.0.0.1:11434/api/chat -d \
-  '{"model":"nemotron-3-nano:30b","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
 ---
