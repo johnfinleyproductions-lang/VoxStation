@@ -14,19 +14,32 @@ RUN pip3 install --no-cache-dir packaging
 RUN pip3 install --no-cache-dir torch torchaudio \
     --index-url https://download.pytorch.org/whl/nightly/cu128
 
-# Step 2: Pin the installed nightly version in a constraints file.
-# Without this, chatterbox-tts and resemble-perth resolve torch as a
-# transitive dependency and pip downgrades to stable cu124 from PyPI,
-# removing Blackwell sm_120 kernels. The constraints file prevents pip
-# from changing torch to any other version in subsequent install steps.
-RUN pip3 show torch | grep '^Version:' | sed 's/Version: /torch==/' > /tmp/torch_pin.txt && \
-    pip3 show torchaudio | grep '^Version:' | sed 's/Version: /torchaudio==/' >> /tmp/torch_pin.txt && \
-    echo "Pinned torch constraint:" && cat /tmp/torch_pin.txt
+# Step 2: Install everything except torch, torchaudio, and chatterbox-tts.
+# chatterbox-tts (all versions 0.1.0-0.1.7) hard-pins torchaudio==2.6.0.
+# Including it here would trigger pip to downgrade our nightly torchaudio.
+RUN grep -vE '^torch|^torchaudio|^chatterbox' requirements.txt > /tmp/reqs_base.txt && \
+    pip3 install --no-cache-dir -r /tmp/reqs_base.txt
 
-# Step 3: Install all other requirements with the nightly pin enforced.
-# pip will see torch is already installed at the pinned version and skip it.
-RUN grep -vE '^torch|^torchaudio' requirements.txt > /tmp/reqs_notorch.txt && \
-    pip3 install --no-cache-dir -c /tmp/torch_pin.txt -r /tmp/reqs_notorch.txt
+# Step 3: Install chatterbox-tts WITHOUT following its dependencies.
+# --no-deps bypasses the torchaudio==2.6.0 hard pin in package metadata.
+# chatterbox's runtime code is API-compatible with nightly torchaudio.
+RUN pip3 install --no-cache-dir --no-deps chatterbox-tts
+
+# Step 4: Install chatterbox's runtime deps manually (all except torchaudio).
+# These are the transitive deps from chatterbox-tts==0.1.7 that are NOT
+# torch/torchaudio and do not conflict with the nightly build.
+RUN pip3 install --no-cache-dir \
+    "resemble-perth>=1.0.0" \
+    "pykakasi==2.3.0" \
+    "diffusers==0.29.0" \
+    omegaconf \
+    "librosa==0.11.0" \
+    s3tokenizer \
+    spacy-pkuseg \
+    "transformers==5.2.0" \
+    "safetensors==0.5.3" \
+    "conformer==0.3.2" \
+    pyloudnorm
 
 # App code
 COPY . .
