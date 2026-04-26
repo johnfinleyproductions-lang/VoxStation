@@ -4,6 +4,17 @@ TTS Service with Voice Cloning
 GPU-accelerated text-to-speech using Chatterbox (Resemble AI).
 Zero-shot voice cloning from a short reference audio sample.
 
+Supports two model variants via VOXSTATION_MODEL_VARIANT env var:
+  - "turbo" (default) — ChatterboxTurboTTS, 350M params, ~75ms latency, 6x realtime
+  - "standard" — ChatterboxTTS, the original model
+
+Voice profiles come from two directories:
+  - voices_dir (./voices) — voices cloned via /voices/clone endpoint
+  - stock_voices_dir (./stock_voices) — bundled reference voices shipped with the repo
+
+Both follow the same on-disk layout:
+  <id>/sample_NN.wav  + optional meta.json with name + description.
+
 Runs on CUDA (Blackwell sm_120) using PyTorch nightly cu128.
 Audio is saved via soundfile — torchaudio.save() in nightly torch 2.12+
 defaults to TorchCodec which is not installed.
@@ -58,21 +69,33 @@ def convert_to_wav(audio_bytes: bytes) -> bytes:
 
 
 class TTSService:
-    """Manages Chatterbox model, voice profiles, and synthesis."""
+    """Manages Chatterbox model, voice profiles (cloned + stock), and synthesis."""
 
     def __init__(self):
         self.model = None
         self.voices_dir = settings.voices_dir
+        self.stock_voices_dir = settings.stock_voices_dir
         self.voices_dir.mkdir(parents=True, exist_ok=True)
+        self.stock_voices_dir.mkdir(parents=True, exist_ok=True)
 
     def load_model(self):
-        """Load Chatterbox TTS onto configured device."""
-        from chatterbox.tts import ChatterboxTTS
+        """Load Chatterbox TTS onto configured device.
 
+        Switches between Turbo and Standard based on settings.model_variant.
+        """
         device = settings.xtts_device
-        logger.info("Loading Chatterbox TTS on %s...", device)
-        self.model = ChatterboxTTS.from_pretrained(device=device)
-        logger.info("Chatterbox TTS loaded on %s", device)
+        variant = (settings.model_variant or "turbo").lower()
+
+        if variant == "turbo":
+            from chatterbox.tts_turbo import ChatterboxTurboTTS
+            logger.info("Loading Chatterbox Turbo on %s...", device)
+            self.model = ChatterboxTurboTTS.from_pretrained(device=device)
+            logger.info("Chatterbox Turbo loaded on %s", device)
+        else:
+            from chatterbox.tts import ChatterboxTTS
+            logger.info("Loading Chatterbox (standard) on %s...", device)
+            self.model = ChatterboxTTS.from_pretrained(device=device)
+            logger.info("Chatterbox (standard) loaded on %s", device)
 
     def unload(self):
         """Release model from memory."""
@@ -81,35 +104,59 @@ class TTSService:
             torch.cuda.empty_cache()
         logger.info("Chatterbox TTS model unloaded")
 
-    def list_voices(self) -> list[dict]:
-        """List all available voice profiles."""
-        voices = []
-        for voice_dir in sorted(self.voices_dir.iterdir()):
+    def _scan_voice_dir(self, root: Path, kind: str) -> list[dict]:
+        """Scan one voice root directory and return entries."""
+        entries = []
+        if not root.exists():
+            return entries
+        for voice_dir in sorted(root.iterdir()):
             if not voice_dir.is_dir():
                 continue
             meta_file = voice_dir / "meta.json"
             samples = list(voice_dir.glob("*.wav"))
+            if not samples:
+                continue
             meta = {}
             if meta_file.exists():
-                meta = json.loads(meta_file.read_text())
-            voices.append({
+                try:
+                    meta = json.loads(meta_file.read_text())
+                except json.JSONDecodeError:
+                    logger.warning("Bad meta.json for %s", voice_dir.name)
+            entries.append({
                 "id": voice_dir.name,
                 "name": meta.get("name", voice_dir.name),
                 "description": meta.get("description", ""),
+                "kind": kind,
                 "sample_count": len(samples),
                 "samples": [s.name for s in samples],
             })
-        return voices
+        return entries
+
+    def list_voices(self) -> list[dict]:
+        """List all available voice profiles, stock first then cloned.
+
+        Cloned voices override stock voices with the same id.
+        """
+        stock = self._scan_voice_dir(self.stock_voices_dir, "stock")
+        cloned = self._scan_voice_dir(self.voices_dir, "cloned")
+        merged = {entry["id"]: entry for entry in stock}
+        for entry in cloned:
+            merged[entry["id"]] = entry
+        return list(merged.values())
 
     def get_voice_sample(self, voice_id: str) -> str:
-        """Get file path to a voice's reference sample (best one)."""
-        voice_dir = self.voices_dir / voice_id
-        if not voice_dir.exists():
-            raise ValueError(f"Voice '{voice_id}' not found")
-        samples = sorted(voice_dir.glob("*.wav"))
-        if not samples:
-            raise ValueError(f"No WAV samples found for voice '{voice_id}'")
-        return str(samples[0])
+        """Get file path to a voice's reference sample.
+
+        Tries cloned voices first (most specific), then stock voices.
+        Raises ValueError if voice_id doesn't exist in either directory.
+        """
+        for root in (self.voices_dir, self.stock_voices_dir):
+            voice_dir = root / voice_id
+            if voice_dir.exists():
+                samples = sorted(voice_dir.glob("*.wav"))
+                if samples:
+                    return str(samples[0])
+        raise ValueError(f"Voice '{voice_id}' not found")
 
     async def clone_voice(
         self,
@@ -166,7 +213,8 @@ class TTSService:
         language: str = "en",
     ) -> bytes:
         """
-        Synthesize text to speech using a cloned voice.
+        Synthesize text to speech using a cloned or stock voice.
+
         Uses soundfile to write WAV — avoids torchaudio.save() which
         requires TorchCodec in nightly torch 2.12+.
         """
@@ -188,8 +236,6 @@ class TTSService:
         )
 
         # Convert tensor to numpy and write WAV via soundfile.
-        # torchaudio.save() in nightly 2.12+ defaults to TorchCodec backend
-        # which is not installed — soundfile is always available.
         wav_numpy = wav_tensor.cpu().squeeze().numpy()
         buffer = io.BytesIO()
         sf.write(buffer, wav_numpy, self.model.sr, format="WAV", subtype="PCM_16")

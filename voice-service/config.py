@@ -14,11 +14,16 @@ class Settings(BaseSettings):
     whisper_device: str = "cuda"
     whisper_compute_type: str = ""  # empty = auto-detect based on device
 
-    # XTTS v2 TTS
+    # XTTS / Chatterbox TTS
     xtts_device: str = "cuda"
+    # Model variant: "turbo" (default, ~75ms latency, 350M params)
+    # or "standard" (the original Chatterbox).
+    # Override via VOXSTATION_MODEL_VARIANT env var.
+    model_variant: str = "turbo"
 
     # Paths
     voices_dir: Path = Path("./voices")
+    stock_voices_dir: Path = Path("./stock_voices")
     models_dir: Path = Path("./models")
 
     # Audio defaults
