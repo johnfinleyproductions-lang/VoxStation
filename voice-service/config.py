@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Model variant: "turbo" (default, ~75ms latency, 350M params)
     # or "standard" (the original Chatterbox).
     # Override via VOXSTATION_MODEL_VARIANT env var.
-    model_variant: str = "turbo"
+    model_variant: str = "standard"
 
     # Paths
     voices_dir: Path = Path("./voices")
