@@ -1,0 +1,25 @@
+services:
+  voxstation-voice:
+    build:
+      context: .
+    container_name: voxstation_voice
+    ports:
+      - "8020:8020"
+    volumes:
+      - /data/voxstation/models:/app/models
+      - /data/voxstation/voices:/app/voices
+    environment:
+      - VOXSTATION_HOST=0.0.0.0
+      - VOXSTATION_PORT=8020
+      - VOXSTATION_WHISPER_MODEL=large-v2
+      - VOXSTATION_WHISPER_DEVICE=cuda
+      - VOXSTATION_XTTS_DEVICE=cuda
+      - VOXSTATION_CORS_ORIGINS=["http://localhost:3000","http://192.168.4.182:3000"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
