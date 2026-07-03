@@ -57,6 +57,7 @@ class WhisperService:
         self,
         audio_bytes: bytes,
         language: Optional[str] = None,
+        word_timestamps: bool = False,
     ) -> dict:
         """
         Transcribe audio bytes to text.
@@ -64,6 +65,8 @@ class WhisperService:
         Args:
             audio_bytes: Raw audio file bytes (WAV, MP3, WebM, etc.)
             language: Optional language code (e.g., 'en'). Auto-detect if None.
+            word_timestamps: When True, each segment also carries a "words"
+                list of {word, start, end} for per-word editing tools.
 
         Returns:
             dict with keys: text, language, duration, segments
@@ -80,6 +83,7 @@ class WhisperService:
                 tmp.name,
                 language=language,
                 beam_size=5,
+                word_timestamps=word_timestamps,
                 vad_filter=True,
                 vad_parameters=dict(
                     min_silence_duration_ms=500,
@@ -91,11 +95,21 @@ class WhisperService:
             segments = []
             full_text_parts = []
             for segment in segments_gen:
-                segments.append({
+                entry = {
                     "start": round(segment.start, 2),
                     "end": round(segment.end, 2),
                     "text": segment.text.strip(),
-                })
+                }
+                if word_timestamps:
+                    entry["words"] = [
+                        {
+                            "word": word.word,
+                            "start": round(word.start, 3),
+                            "end": round(word.end, 3),
+                        }
+                        for word in (segment.words or [])
+                    ]
+                segments.append(entry)
                 full_text_parts.append(segment.text.strip())
 
         full_text = " ".join(full_text_parts)

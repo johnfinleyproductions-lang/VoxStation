@@ -16,12 +16,17 @@ router = APIRouter()
 async def transcribe_audio(
     audio: UploadFile = File(..., description="Audio file (WAV, WebM, MP3, etc.)"),
     language: Optional[str] = Form(None, description="Language code (e.g., 'en'). Auto-detect if omitted."),
+    word_timestamps: Optional[str] = Form(
+        None,
+        description="Set to 'true' to include per-word timing on each segment (words: [{word, start, end}]).",
+    ),
 ):
     """
     Transcribe audio to text using Whisper.
 
     Accepts any audio format that ffmpeg supports.
-    Returns the full transcription plus per-segment timestamps.
+    Returns the full transcription plus per-segment timestamps, and per-word
+    timing when word_timestamps=true.
     """
     if whisper_service.model is None:
         raise HTTPException(503, "Whisper model not loaded")
@@ -34,8 +39,14 @@ async def transcribe_audio(
     if len(audio_bytes) > 50 * 1024 * 1024:
         raise HTTPException(413, "Audio file too large (max 50MB)")
 
+    want_words = (word_timestamps or "").strip().lower() in ("true", "1", "yes")
+
     try:
-        result = await whisper_service.transcribe(audio_bytes, language=language)
+        result = await whisper_service.transcribe(
+            audio_bytes,
+            language=language,
+            word_timestamps=want_words,
+        )
         return result
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {str(e)}")
